@@ -221,14 +221,12 @@ wss.on('connection', (ws, req) => {
       console.log('[Session] Connected to OpenAI Realtime API')
 
       // Your Chaim greeting
-      session.sendMessage({
-        type: 'input_text',
-        text:
-          "Use a cheerful, youthful tone. " +
-          "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. " +
-          "Think of me as the teacher's pet. What can I help you with? " +
-          "You can say things like, 'When is my pickup?'",
-      })
+      session.sendMessage(
+    "Use a cheerful, youthful tone. " +
+    "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. " +
+    "Think of me as the teacher's pet. What can I help you with? " +
+    "You can say things like, 'When is my pickup?'"
+      )
     } catch (err) {
       console.error('[Session] Failed to connect to OpenAI:', err)
       ws.close()
