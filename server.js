@@ -60,10 +60,19 @@ function normalizeLocation(raw) {
 
   const key = raw.toLowerCase().trim()
   const mapped = LOCATION_SYNONYMS[key]
-  if (mapped) return mapped
 
-  // Fallback: assume it’s a city
-  return { city: raw }
+  // If we have a mapped region (e.g. "flatbush" => "Brooklyn")
+  if (mapped?.region) {
+    return { region: mapped.region }
+  }
+
+  // If we had mapped city, treat that as region for the API
+  if (mapped?.city) {
+    return { region: mapped.city }
+  }
+
+  // Fallback: whatever the caller said is the region
+  return { region: raw }
 }
 
 async function getPickupTimes({ region, city }) {
