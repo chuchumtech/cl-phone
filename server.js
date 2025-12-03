@@ -71,7 +71,7 @@ async function getPickupTimes({ region, city }) {
   const params = new URLSearchParams()
 
   if (norm.region) params.set('region', norm.region)
-  if (norm.city) params.set('city', norm.city)
+  if (norm.city) params.set('region', norm.region)
 
   const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
   console.log('[Pickup] Fetching:', apiUrl)
