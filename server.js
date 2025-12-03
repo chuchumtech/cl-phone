@@ -25,8 +25,8 @@ Your job:
 - Use the tool results to give a clear answer: date, time window, and address.
 
 FIRST RESPONSE BEHAVIOR (VERY IMPORTANT):
-- In your FIRST SPOKEN RESPONSE of each call, you MUST start by saying this exact greeting, before anything else:
-  "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. Think of me as the teacher's pet. What can I help you with?"
+- At the start of each call, greet the caller with the following. you MUST say this exact greeting and all of it, before anything else:
+  "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. (This next line is a joke so pause and say it excited - for effect) Think of me as the teacher's pet. What can I help you with? You can say things like, "When is my pickup""
 - After you finish saying this greeting, you may continue with the answer to the caller's first question.
 - NEVER skip this greeting, even if the caller immediately asks a question.
 
@@ -49,8 +49,8 @@ const LOCATION_SYNONYMS = {
   boropark: { region: 'Brooklyn' },
   flatbush: { region: 'Brooklyn' },
   brooklyn: { region: 'Brooklyn' },
-  lakewood: { city: 'Lakewood' },
-  monsey: { city: 'Monsey' },
+  lakewood: { region: 'Lakewood' },
+  monsey: { region: 'Monsey' },
   'five towns': { region: 'Five Towns' },
   // add more as needed
 }
@@ -111,6 +111,18 @@ function formatTime24To12(t) {
   })
 }
 
+function formatSpokenDate(isoDate) {
+  // isoDate like "2025-09-14"
+  if (!isoDate) return ''
+  const d = new Date(isoDate + 'T12:00:00') // avoid timezone weirdness
+  return d.toLocaleDateString('en-US', {
+    weekday: 'long',   // Sunday
+    month: 'long',     // September
+    day: 'numeric',    // 14
+    // we skip the year so it doesn't sound clunky
+  })
+}
+
 const pickupTool = tool({
   name: 'get_pickup_times',
   description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
@@ -138,15 +150,19 @@ const pickupTool = tool({
 
       const first = results[0]
 
-      const date =
-        first.event_date || first.date || '' // event_date from your API
+      // --- Format date + time nicely for speech ----------------------------
+
+      const rawDate = first.event_date || first.date || ''
+      const dateSpoken = formatSpokenDate(rawDate)
+
       const start = formatTime24To12(first.start_time)
       const end = formatTime24To12(first.end_time)
-      const time_window =
+
+      const timeWindowSpoken =
         first.is_tbd
-          ? 'a time that will be announced closer to the event'
+          ? '' // if TBD, we’ll just omit the time window for now
           : start && end
-          ? `${start} and ${end}`
+          ? `${start} to ${end}`
           : ''
 
       const address =
@@ -162,10 +178,14 @@ const pickupTool = tool({
           .filter(Boolean)
           .join(', ')
 
+      // Prefer region-style label (Brooklyn / Monsey / Lakewood)
+      const cityLabel =
+        first.region || first.city || city || region || 'your location'
+
       const spoken_text = speakAnswer('pickup_success', {
-        city: first.city || city || region || 'your location',
-        date,
-        time_window,
+        city: cityLabel,
+        date_spoken: dateSpoken,
+        time_window: timeWindowSpoken,
         address,
       })
 
