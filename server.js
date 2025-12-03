@@ -136,7 +136,7 @@ const pickupTool = tool({
       const results = await getPickupTimes({ region, city })
 
       if (!results.length) {
-        const spoken_text = speakAnswer('pickup_not_found', {
+        const spoken_text = await speakAnswer('pickup_not_found', {
           city,
           region,
         })
@@ -182,7 +182,7 @@ const pickupTool = tool({
       const cityLabel =
         first.region || first.city || city || region || 'your location'
 
-      const spoken_text = speakAnswer('pickup_success', {
+      const spoken_text = await speakAnswer('pickup_success', {
         city: cityLabel,
         date_spoken: dateSpoken,
         time_window: timeWindowSpoken,
@@ -196,7 +196,7 @@ const pickupTool = tool({
       }
     } catch (err) {
       console.error('[Tool:get_pickup_times] Error:', err)
-      const spoken_text = speakAnswer('fallback_error')
+      const spoken_text = await speakAnswer('fallback_error')
       return {
         spoken_text,
         has_results: false,
