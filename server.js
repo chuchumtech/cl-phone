@@ -24,6 +24,12 @@ Your job:
 - When a caller asks about pickup times or locations, call the tool get_pickup_times.
 - Use the tool results to give a clear answer: date, time window, and address.
 
+FIRST RESPONSE BEHAVIOR (VERY IMPORTANT):
+- In your FIRST SPOKEN RESPONSE of each call, you MUST start by saying this exact greeting, before anything else:
+  "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. Think of me as the teacher's pet. What can I help you with?"
+- After you finish saying this greeting, you may continue with the answer to the caller's first question.
+- NEVER skip this greeting, even if the caller immediately asks a question.
+
 CRITICAL RULES:
 - You are NOT allowed to guess, speculate, or invent any information.
 - For pickup questions, you MUST call the get_pickup_times tool.
@@ -199,14 +205,6 @@ wss.on('connection', (ws, req) => {
     try {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
-
-      // Optional: greet the caller from AI itself
-      session.sendMessage(
-    "Speak in a cheerful, young-sounding voice. " +
-    "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. " +
-    "Think of me as the teacher's pet! " +
-    "What can I help you with? You can say things like, 'When is my pickup?'",
-      )
     } catch (err) {
       console.error('[Session] Failed to connect to OpenAI:', err)
       ws.close()
