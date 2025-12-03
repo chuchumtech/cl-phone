@@ -5,6 +5,7 @@ import dotenv from 'dotenv'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
+import { speakAnswer } from './answers.js'   // 👈 NEW
 
 dotenv.config()
 
@@ -81,29 +82,6 @@ async function getPickupTimes({ region, city }) {
   return json.results || []
 }
 
-// --- Temporary inline "templates" (no Supabase yet) ------------------------
-
-function speakAnswer(key, params = {}) {
-  if (key === 'pickup_not_found') {
-    const where = params.city || params.region || 'that location'
-    return `I don't have pickup information for ${where} yet.`
-  }
-
-  if (key === 'pickup_success') {
-    const city = params.city || 'your location'
-    const date = params.date || 'an upcoming date'
-    const time = params.time_window || 'a scheduled time window'
-    const addr = params.address || 'the usual pickup address'
-    return `Pickup in ${city} is on ${date}, between ${time}, at ${addr}.`
-  }
-
-  if (key === 'fallback_error') {
-    return 'Sorry, I am having trouble accessing pickup information right now.'
-  }
-
-  return "I don't have that answer configured yet."
-}
-
 // --- Tool: pickup-times using speakAnswer -----------------------------------
 
 const pickupTool = tool({
@@ -113,15 +91,16 @@ const pickupTool = tool({
     region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
     city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
   }),
+  // args: { region?: string; city?: string }
   execute: async ({ region, city }) => {
     try {
       console.log('[Tool:get_pickup_times] Called with:', { region, city })
       const results = await getPickupTimes({ region, city })
 
       if (!results.length) {
-        const spoken_text = speakAnswer('pickup_not_found', {
-          city,
-          region,
+        // No data for that location → use a fixed, safe template
+        const spoken_text = await speakAnswer('pickup_not_found', {
+          city: city || region || 'that location',
         })
 
         return {
@@ -131,9 +110,10 @@ const pickupTool = tool({
         }
       }
 
+      // Use the first result as the primary answer (you can change this later)
       const first = results[0]
 
-      const spoken_text = speakAnswer('pickup_success', {
+      const spoken_text = await speakAnswer('pickup_success', {
         city: first.city || city || region || 'your location',
         date: first.date || '',
         time_window: first.time_window || '',
@@ -147,7 +127,7 @@ const pickupTool = tool({
       }
     } catch (err) {
       console.error('[Tool:get_pickup_times] Error:', err)
-      const spoken_text = speakAnswer('fallback_error')
+      const spoken_text = await speakAnswer('fallback_error')
       return {
         spoken_text,
         has_results: false,
@@ -180,33 +160,33 @@ wss.on('connection', (ws, req) => {
 
   console.log('[WS] New Twilio media stream connected')
 
+  // --- Create the Realtime agent for THIS call -----------------------------
+
   const agent = new RealtimeAgent({
     name: 'Chasdei Lev Pickup Assistant',
     instructions: SYSTEM_PROMPT,
     tools: [pickupTool],
   })
 
+  // --- Bridge Twilio <-> OpenAI via the Twilio transport -------------------
+
   const twilioTransport = new TwilioRealtimeTransportLayer({
-    twilioWebSocket: ws,
+    twilioWebSocket: ws, // this is the Twilio Media Streams WS connection
   })
 
   const session = new RealtimeSession(agent, {
     transport: twilioTransport,
-    model: 'gpt-realtime',
+    model: 'gpt-realtime', // OpenAI Realtime voice model
     config: {
       audio: {
         output: {
-          voice: 'verse',
-          style: {
-            tone: 'cheerful',
-            mood: 'friendly',
-            age: 'young',
-          },
+          voice: 'verse', // you can change the voice later if you want
         },
       },
     },
   })
 
+  // Optional: log basic events from the session
   session.on('response.completed', () => {
     console.log('[Session] Response completed')
   })
@@ -220,12 +200,12 @@ wss.on('connection', (ws, req) => {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
 
-      // Your Chaim greeting
+      // Optional: greet the caller from AI itself
       session.sendMessage(
-    "Use a cheerful, youthful tone. " +
+    "Speak in a cheerful, young-sounding voice. " +
     "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. " +
-    "Think of me as the teacher's pet. What can I help you with? " +
-    "You can say things like, 'When is my pickup?'"
+    "Think of me as the teacher's pet! " +
+    "What can I help you with? You can say things like, 'When is my pickup?'",
       )
     } catch (err) {
       console.error('[Session] Failed to connect to OpenAI:', err)
