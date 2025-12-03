@@ -5,6 +5,7 @@ import dotenv from 'dotenv'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
+import { speakAnswer } from './answers.js'   // 👈 NEW
 
 dotenv.config()
 
@@ -23,10 +24,16 @@ Your job:
 - When a caller asks about pickup times or locations, call the tool get_pickup_times.
 - Use the tool results to give a clear answer: date, time window, and address.
 
-Rules:
-- Speak slowly and clearly.
-- Never guess times or locations. Always call the tool.
-- If the caller asks something unrelated to pickup times, explain you can only help with pickup times.
+CRITICAL RULES:
+- You are NOT allowed to guess, speculate, or invent any information.
+- For pickup questions, you MUST call the get_pickup_times tool.
+- The tool returns an object that includes a field named "spoken_text".
+- You must speak ONLY the "spoken_text" value, exactly as it is, with no extra words before or after.
+- Do NOT add extra suggestions like "maybe contact the organizers" or anything similar.
+- If the tool's "spoken_text" says that there is no information, you must say only that and nothing more.
+- If the caller asks about something outside pickup times and locations, say exactly:
+  "I only have information about pickup times and locations."
+- You are not a general assistant; you answer only using tool results.
 `
 
 // --- Location helpers -------------------------------------------------------
@@ -75,6 +82,61 @@ async function getPickupTimes({ region, city }) {
   return json.results || []
 }
 
+// --- Tool: pickup-times using speakAnswer -----------------------------------
+
+const pickupTool = tool({
+  name: 'get_pickup_times',
+  description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
+  parameters: z.object({
+    region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
+    city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
+  }),
+  // args: { region?: string; city?: string }
+  execute: async ({ region, city }) => {
+    try {
+      console.log('[Tool:get_pickup_times] Called with:', { region, city })
+      const results = await getPickupTimes({ region, city })
+
+      if (!results.length) {
+        // No data for that location → use a fixed, safe template
+        const spoken_text = await speakAnswer('pickup_not_found', {
+          city: city || region || 'that location',
+        })
+
+        return {
+          spoken_text,
+          has_results: false,
+          results: [],
+        }
+      }
+
+      // Use the first result as the primary answer (you can change this later)
+      const first = results[0]
+
+      const spoken_text = await speakAnswer('pickup_success', {
+        city: first.city || city || region || 'your location',
+        date: first.date || '',
+        time_window: first.time_window || '',
+        address: first.address || '',
+      })
+
+      return {
+        spoken_text,
+        has_results: true,
+        results,
+      }
+    } catch (err) {
+      console.error('[Tool:get_pickup_times] Error:', err)
+      const spoken_text = await speakAnswer('fallback_error')
+      return {
+        spoken_text,
+        has_results: false,
+        results: [],
+      }
+    }
+  },
+})
+
 // --- HTTP + WebSocket server -----------------------------------------------
 
 const PORT = process.env.PORT || 8080
@@ -98,24 +160,7 @@ wss.on('connection', (ws, req) => {
 
   console.log('[WS] New Twilio media stream connected')
 
-  // --- Define the pickup-times tool for the agent --------------------------
-
-  const pickupTool = tool({
-    name: 'get_pickup_times',
-    description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
-    parameters: z.object({
-      region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
-      city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
-    }),
-    // args: { region?: string; city?: string }
-    execute: async ({ region, city }) => {
-      console.log('[Tool:get_pickup_times] Called with:', { region, city })
-      const results = await getPickupTimes({ region, city })
-      return results
-    },
-  })
-
-  // --- Create the Realtime agent -------------------------------------------
+  // --- Create the Realtime agent for THIS call -----------------------------
 
   const agent = new RealtimeAgent({
     name: 'Chasdei Lev Pickup Assistant',
@@ -154,6 +199,16 @@ wss.on('connection', (ws, req) => {
     try {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
+
+      // Optional: greet the caller from AI itself
+      session.sendMessage({
+        type: 'input_text',
+        text:
+    "Speak in a cheerful, young-sounding voice. " +
+    "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant. " +
+    "Think of me as the teacher's pet! " +
+    "What can I help you with? You can say things like, 'When is my pickup?'",
+      })
     } catch (err) {
       console.error('[Session] Failed to connect to OpenAI:', err)
       ws.close()
@@ -162,8 +217,6 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log('[WS] Twilio stream closed')
-    // Session will end automatically when transport closes,
-    // but you could add extra cleanup here if needed.
   })
 
   ws.on('error', (err) => {
