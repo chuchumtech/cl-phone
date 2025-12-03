@@ -90,6 +90,18 @@ async function getPickupTimes({ region, city }) {
 
 // --- Tool: pickup-times using speakAnswer -----------------------------------
 
+function formatTime24To12(t) {
+  // t is like "12:30:00"
+  if (!t) return ''
+  const [h, m] = t.split(':')
+  const date = new Date()
+  date.setHours(Number(h), Number(m), 0, 0)
+  return date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
 const pickupTool = tool({
   name: 'get_pickup_times',
   description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
@@ -97,16 +109,15 @@ const pickupTool = tool({
     region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
     city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
   }),
-  // args: { region?: string; city?: string }
   execute: async ({ region, city }) => {
     try {
       console.log('[Tool:get_pickup_times] Called with:', { region, city })
       const results = await getPickupTimes({ region, city })
 
       if (!results.length) {
-        // No data for that location → use a fixed, safe template
-        const spoken_text = await speakAnswer('pickup_not_found', {
-          city: city || region || 'that location',
+        const spoken_text = speakAnswer('pickup_not_found', {
+          city,
+          region,
         })
 
         return {
@@ -116,14 +127,37 @@ const pickupTool = tool({
         }
       }
 
-      // Use the first result as the primary answer (you can change this later)
       const first = results[0]
 
-      const spoken_text = await speakAnswer('pickup_success', {
+      const date =
+        first.event_date || first.date || '' // event_date from your API
+      const start = formatTime24To12(first.start_time)
+      const end = formatTime24To12(first.end_time)
+      const time_window =
+        first.is_tbd
+          ? 'a time that will be announced closer to the event'
+          : start && end
+          ? `${start} and ${end}`
+          : ''
+
+      const address =
+        first.full_address ||
+        [
+          first.location_name,
+          first.address_line1,
+          first.address_line2,
+          first.city,
+          first.state,
+          first.postal_code,
+        ]
+          .filter(Boolean)
+          .join(', ')
+
+      const spoken_text = speakAnswer('pickup_success', {
         city: first.city || city || region || 'your location',
-        date: first.date || '',
-        time_window: first.time_window || '',
-        address: first.address || '',
+        date,
+        time_window,
+        address,
       })
 
       return {
@@ -133,7 +167,7 @@ const pickupTool = tool({
       }
     } catch (err) {
       console.error('[Tool:get_pickup_times] Error:', err)
-      const spoken_text = await speakAnswer('fallback_error')
+      const spoken_text = speakAnswer('fallback_error')
       return {
         spoken_text,
         has_results: false,
