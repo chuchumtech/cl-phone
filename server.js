@@ -17,7 +17,7 @@ if (!OPENAI_API_KEY) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. PROMPT MANAGEMENT (DB LOADER)
+// 1. PROMPT MANAGEMENT
 // ---------------------------------------------------------------------------
 
 const PROMPTS = {
@@ -42,9 +42,7 @@ async function loadPromptsFromDB() {
       if (row.key === 'agent_items') PROMPTS.items = row.content
     })
     
-    // Fallback if DB is empty
     if (!PROMPTS.router) PROMPTS.router = "You are the router. Greet the user and transfer them."
-    
     console.log('[Prompts] Loaded agent personas from DB')
   } catch (err) {
     console.error('[Prompts] Error loading from DB:', err)
@@ -115,6 +113,17 @@ const server = http.createServer((req, res) => {
 })
 
 const wss = new WebSocketServer({ server })
+
+// HELPER: Extract JSON definition from Tool Object for raw API updates
+function formatTools(toolList) {
+  return toolList.map(t => {
+    // If it's already a definition, return it
+    if (t.type === 'function') return t
+    // If it's the SDK tool wrapper, extract the definition
+    if (t.definition) return { type: 'function', ...t.definition }
+    return t
+  })
+}
 
 wss.on('connection', (ws, req) => {
   const { pathname } = url.parse(req.url || '')
@@ -200,11 +209,11 @@ wss.on('connection', (ws, req) => {
     execute: async () => {
       console.log('[Router] -> Pickup Specialist')
       try {
-        if (currentSession) {
-            // Update session with NEW instructions and NEW tools
-            await currentSession.update({
+        if (currentSession && currentSession.client) {
+            // FIX: Use .client.updateSession()
+            await currentSession.client.updateSession({
                 instructions: PROMPTS.pickup,
-                tools: [pickupTool, transferToRouterTool] // We expose ONLY these to OpenAI
+                tools: formatTools([pickupTool, transferToRouterTool]) // Use helper
             })
         }
         return "Transferring you to the pickup scheduler."
@@ -222,10 +231,10 @@ wss.on('connection', (ws, req) => {
     execute: async () => {
       console.log('[Router] -> Items Specialist')
       try {
-        if (currentSession) {
-            await currentSession.update({
+        if (currentSession && currentSession.client) {
+            await currentSession.client.updateSession({
                 instructions: PROMPTS.items,
-                tools: [itemInfoTool, transferToRouterTool]
+                tools: formatTools([itemInfoTool, transferToRouterTool])
             })
         }
         return "Transferring you to the item specialist."
@@ -243,10 +252,10 @@ wss.on('connection', (ws, req) => {
     execute: async () => {
       console.log('[Nav] -> Router')
       try {
-        if (currentSession) {
-            await currentSession.update({
+        if (currentSession && currentSession.client) {
+            await currentSession.client.updateSession({
                 instructions: PROMPTS.router,
-                tools: [transferToPickupTool, transferToItemsTool]
+                tools: formatTools([transferToPickupTool, transferToItemsTool])
             })
         }
         return "One moment, let me switch departments."
@@ -259,7 +268,7 @@ wss.on('connection', (ws, req) => {
 
   // --- INITIALIZATION ---
   
-  // CRITICAL FIX: Register ALL tools here so the Agent knows how to execute them.
+  // Register ALL tools locally so the Agent knows how to run them
   const allTools = [
     pickupTool, 
     itemInfoTool, 
@@ -271,7 +280,7 @@ wss.on('connection', (ws, req) => {
   const agent = new RealtimeAgent({
     name: 'Chasdei Lev Assistant',
     instructions: PROMPTS.router, 
-    tools: allTools, // Register EVERYTHING locally
+    tools: allTools, 
   })
 
   const twilioTransport = new TwilioRealtimeTransportLayer({
@@ -283,7 +292,7 @@ wss.on('connection', (ws, req) => {
     model: 'gpt-realtime', 
     config: {
         audio: { output: { voice: 'verse' } },
-        // IMPORTANT: Initialize OpenAI with ONLY the Router tools visible
+        // Initially, OpenAI only sees the Router tools
         tools: [transferToPickupTool, transferToItemsTool] 
     },
   })
@@ -295,8 +304,6 @@ wss.on('connection', (ws, req) => {
     try {
       await currentSession.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
-      
-      // Start conversation
       currentSession.sendMessage('GREETING_TRIGGER')
     } catch (err) {
       console.error('[Session] Connect failed:', err)
