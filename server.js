@@ -201,15 +201,15 @@ wss.on('connection', (ws, req) => {
       
       await session.updateAgent(pickupAgent) 
       
-      // FIX 1: Small delay to ensure agent switch registers
       if (summary) {
+        // FIX 1: INCREASED DELAY TO 500ms to allow Router to "finish" responding
         setTimeout(() => {
             if(session) session.sendMessage(summary)
-        }, 100)
+        }, 500)
       }
       
-      // FIX 2: Return null so the OLD agent doesn't try to speak over the NEW agent
-      return null
+      // FIX 2: Return a string to formally close the Router's turn
+      return "Transferring..."
     }
   })
 
@@ -227,10 +227,10 @@ wss.on('connection', (ws, req) => {
       if (summary) {
         setTimeout(() => {
             if(session) session.sendMessage(summary)
-        }, 100)
+        }, 500)
       }
 
-      return null
+      return "Transferring..."
     }
   })
 
@@ -242,13 +242,11 @@ wss.on('connection', (ws, req) => {
       console.log('🔄 Switching to Router')
       await session.updateAgent(routerAgent)
       
-      // FIX: Simulate message to trigger the "Returning User" prompt
       setTimeout(() => {
           if(session) session.sendMessage("I need help with something else.")
-      }, 100)
+      }, 500)
       
-      // Return null to avoid "Conversation already has response" race condition
-      return null
+      return "Transferring..."
     }
   })
 
@@ -282,14 +280,18 @@ wss.on('connection', (ws, req) => {
     }
   })
 
-  // FIX 3: GLOBAL ERROR HANDLER TO PREVENT CRASHES
+  // FIX 3: ROBUST ERROR LISTENER (Prevents crashes)
   session.on('error', (err) => {
-      console.error('[Session Error]', err)
-      // We explicitly ignore the "active response" error because it's a side effect of our fast switching
-      if (err.message && err.message.includes('conversation_already_has_active_response')) {
-          console.log('-> Ignored overlap error during handoff')
-          return
+      // Safely extract the error message from various nesting levels
+      const msg = err.message || (err.error && err.error.message) || (err.error && err.error.error && err.error.error.message) || JSON.stringify(err);
+      
+      if (typeof msg === 'string' && msg.includes('conversation_already_has_active_response')) {
+          console.log('[System] Swallowed "Active Response" race condition (Expected behavior during handoff)')
+          return; // Ignore this specific error
       }
+      
+      // Log legitimate errors
+      console.error('[Session Error]', msg)
   })
 
   session.connect({ apiKey: OPENAI_API_KEY })
