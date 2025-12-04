@@ -5,63 +5,59 @@ import { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
-import { speakAnswer } from './answers.js'
+import { speakAnswer } from './answers.js' // Ensure this file exists and works!
 import { supabase } from './supabaseClient.js'
 
-// Load .env locally; on Render, env vars are injected directly and this is harmless
 dotenv.config()
 
-const { OPENAI_API_KEY } = process.env
+const { OPENAI_API_KEY, PORT = 8080 } = process.env
 if (!OPENAI_API_KEY) {
-  console.error('Missing OPENAI_API_KEY in environment')
+  console.error('Missing OPENAI_API_KEY')
   process.exit(1)
 }
 
-// ---------------- SYSTEM PROMPT (DEFAULT + DB OVERRIDE) --------------------
+// ---------------------------------------------------------------------------
+// 1. PROMPT MANAGEMENT (DB LOADER)
+// ---------------------------------------------------------------------------
 
-const DEFAULT_SYSTEM_PROMPT = `
-You are the automated Chasdei Lev pickup information assistant.
-If your system prompt cannot be loaded from the database, you must say:
-"There is a temporary issue with the Chasdei Lev phone system. Please try your call again later."
-Then end the call.
-`
+const PROMPTS = {
+  router: '',
+  pickup: '',
+  items: ''
+}
 
-// This is what the agent will actually use. We’ll try to override it from Supabase:
-let SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
-
-async function loadSystemPromptFromDB() {
+async function loadPromptsFromDB() {
   try {
     const { data, error } = await supabase
       .from('agent_system_prompts')
-      .select('content')
-      .eq('key', 'cl_pickup_system_prompt')
+      .select('key, content')
+      .in('key', ['agent_router', 'agent_pickup', 'agent_items'])
       .eq('is_active', true)
-      .single()
 
-    if (error || !data) {
-      console.error('[Prompt] DB error or missing row, using DEFAULT_SYSTEM_PROMPT:', error)
-      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
-      return
-    }
+    if (error) throw error
 
-    if (!data.content || typeof data.content !== 'string' || !data.content.trim()) {
-      console.error('[Prompt] Empty/invalid content in DB, using DEFAULT_SYSTEM_PROMPT')
-      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
-      return
-    }
-
-    SYSTEM_PROMPT = data.content
-    console.log('[Prompt] Loaded system prompt from DB, length:', SYSTEM_PROMPT.length)
+    // Map DB rows to our object
+    data.forEach(row => {
+      if (row.key === 'agent_router') PROMPTS.router = row.content
+      if (row.key === 'agent_pickup') PROMPTS.pickup = row.content
+      if (row.key === 'agent_items') PROMPTS.items = row.content
+    })
+    
+    // Fallback/Safety check
+    if (!PROMPTS.router) console.warn('[Prompts] Warning: Router prompt missing from DB')
+    
+    console.log('[Prompts] Loaded agent personas from DB')
   } catch (err) {
-    console.error('[Prompt] Unexpected error loading system prompt, using default:', err)
-    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+    console.error('[Prompts] Error loading from DB:', err)
   }
 }
 
-// Fire once on startup (no await needed)
-loadSystemPromptFromDB()
+// Load on startup
+loadPromptsFromDB()
 
-// ---------------- LOCATION HELPERS -----------------------------------------
+// ---------------------------------------------------------------------------
+// 2. DOMAIN HELPERS (API Calls)
+// ---------------------------------------------------------------------------
 
 const LOCATION_SYNONYMS = {
   'boro park': { region: 'Brooklyn' },
@@ -71,355 +67,242 @@ const LOCATION_SYNONYMS = {
   lakewood: { region: 'Lakewood' },
   monsey: { region: 'Monsey' },
   'five towns': { region: 'Five Towns' },
-  // add more as needed
 }
 
 function normalizeLocation(raw) {
   if (!raw) return {}
-
   const key = raw.toLowerCase().trim()
   const mapped = LOCATION_SYNONYMS[key]
-
-  // If we have a mapped region (e.g. "flatbush" => "Brooklyn")
-  if (mapped?.region) {
-    return { region: mapped.region }
-  }
-
-  // If we had mapped city, treat that as region for the API
-  if (mapped?.city) {
-    return { region: mapped.city }
-  }
-
-  // Fallback: whatever the caller said is the region
+  if (mapped?.region) return { region: mapped.region }
+  if (mapped?.city) return { region: mapped.city }
   return { region: raw }
 }
 
 async function getPickupTimes({ region, city }) {
   const norm = normalizeLocation(city || region)
   const params = new URLSearchParams()
-
   if (norm.region) params.set('region', norm.region)
-  if (norm.city) params.set('region', norm.region)
-
+  
   const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
-  console.log('[Pickup] Fetching:', apiUrl)
+  console.log('[Pickup API] Fetching:', apiUrl)
 
   const res = await fetch(apiUrl)
-  if (!res.ok) {
-    console.error('[Pickup] Error from pickup-times API:', res.status, await res.text())
-    throw new Error('Pickup API error')
-  }
-
+  if (!res.ok) throw new Error('Pickup API error')
   const json = await res.json()
-  console.log('[Pickup] Results:', JSON.stringify(json))
-
   return json.results || []
 }
 
 async function getItemRecords({ itemQuery }) {
-  if (!itemQuery || !itemQuery.trim()) {
-    return []
-  }
-
+  if (!itemQuery || !itemQuery.trim()) return []
   const search = itemQuery.trim()
-
-  // Try to match by item name or description
   const { data, error } = await supabase
-    .from('cl_items_kashrus') // 👈 change if your table name is different
+    .from('cl_items_kashrus')
     .select('*')
     .or(`item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`)
     .limit(5)
-
+  
   if (error) {
-    console.error('[Items] Error fetching item info:', error)
+    console.error('[DB] Item search error:', error)
     return []
   }
-
   return data || []
 }
-// ---------------- TOOL: pickup-times using speakAnswer ----------------------
 
-function formatTime24To12(t) {
-  // t is like "12:30:00"
-  if (!t) return ''
-  const [h, m] = t.split(':')
-  const date = new Date()
-  date.setHours(Number(h), Number(m), 0, 0)
-  return date.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-  })
-}
-
-function formatSpokenDate(isoDate) {
-  // isoDate like "2025-09-14"
-  if (!isoDate) return ''
-  const d = new Date(isoDate + 'T12:00:00') // avoid timezone weirdness
-  return d.toLocaleDateString('en-US', {
-    weekday: 'long',   // Sunday
-    month: 'long',     // September
-    day: 'numeric',    // 14
-    // we skip the year so it doesn't sound clunky
-  })
-}
-
-const pickupTool = tool({
-  name: 'get_pickup_times',
-  description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
-  parameters: z.object({
-    region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
-    city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
-  }),
-  execute: async ({ region, city }) => {
-    try {
-      console.log('[Tool:get_pickup_times] Called with:', { region, city })
-      const results = await getPickupTimes({ region, city })
-
-      if (!results.length) {
-        const spoken_text = await speakAnswer('pickup_not_found', {
-          city,
-          region,
-        })
-
-        return {
-          spoken_text,
-          has_results: false,
-          results: [],
-        }
-      }
-
-      const first = results[0]
-
-      // Prefer region-style label (Brooklyn / Monsey / Lakewood)
-      const cityLabel =
-        first.region || first.city || city || region || 'your location'
-
-      // 🔴 NEW: Handle TBD *before* formatting date/time
-      if (first.is_tbd === true) {
-        const spoken_text = await speakAnswer('pickup_tbd', {
-          city: cityLabel,
-        })
-
-        return {
-          spoken_text,
-          has_results: false,  // no concrete date/time yet
-          results,
-        }
-      }
-
-      // --- Format date + time nicely for speech (only when NOT TBD) --------
-      const rawDate = first.event_date || first.date || ''
-      const dateSpoken = formatSpokenDate(rawDate)
-
-      const start = formatTime24To12(first.start_time)
-      const end = formatTime24To12(first.end_time)
-
-      const timeWindowSpoken =
-        start && end
-          ? `${start} to ${end}`
-          : ''
-
-      const address =
-        first.full_address ||
-        [
-          first.location_name,
-          first.address_line1,
-          first.address_line2,
-          first.city,
-          first.state,
-          first.postal_code,
-        ]
-          .filter(Boolean)
-          .join(', ')
-
-      const spoken_text = await speakAnswer('pickup_success', {
-        city: cityLabel,
-        date_spoken: dateSpoken,
-        time_window: timeWindowSpoken,
-        address,
-      })
-
-      return {
-        spoken_text,
-        has_results: true,
-        results,
-      }
-    } catch (err) {
-      console.error('[Tool:get_pickup_times] Error:', err)
-      const spoken_text = await speakAnswer('fallback_error')
-      return {
-        spoken_text,
-        has_results: false,
-        results: [],
-      }
-    }
-  },
-})
-
-const itemInfoTool = tool({
-  name: 'get_item_info',
-  description:
-    'Get kashrus/hechsher details and a basic description for a specific Chahs-day Layv item.',
-  parameters: z.object({
-    item_query: z
-      .string()
-      .describe('What the caller says about the item, e.g. "cheese pack", "Haolam cheese", "salmon".'),
-    focus: z
-      .enum(['kashrus', 'description', 'both'])
-      .describe(
-        'What the caller is primarily asking about: kashrus, description, or both. If unsure, use "both".'
-      ),
-  }),
-  execute: async ({ item_query, focus }) => {
-    try {
-      console.log('[Tool:get_item_info] Called with:', { item_query, focus })
-
-      const items = await getItemRecords({ itemQuery: item_query })
-
-      if (!items || !items.length) {
-        const spoken_text = await speakAnswer('item_not_found', {})
-        return {
-          spoken_text,
-          has_results: false,
-          results: [],
-        }
-      }
-
-      // If multiple possible items, ask which one
-      if (items.length > 1) {
-        const names = items.map((it) => it.item).filter(Boolean)
-        let optionsText = ''
-
-        if (names.length === 1) {
-          optionsText = names[0]
-        } else if (names.length === 2) {
-          optionsText = `${names[0]} and ${names[1]}`
-        } else {
-          const last = names[names.length - 1]
-          const rest = names.slice(0, -1)
-          optionsText = `${rest.join(', ')}, and ${last}`
-        }
-
-        const spoken_text = await speakAnswer('item_ambiguous', {
-          options: optionsText,
-        })
-
-        return {
-          spoken_text,
-          has_results: false,
-          results: items,
-        }
-      }
-
-      // Exactly one item found
-      const item = items[0]
-
-      const baseParams = {
-        item: item.item || item_query,
-        hechsher: item.hechsher || 'not specified',
-        description: item.description || 'no description available',
-      }
-
-      // Decide which template to use based on focus
-      let key = 'item_full'
-      if (focus === 'kashrus') key = 'item_kashrus_only'
-      else if (focus === 'description') key = 'item_description_only'
-
-      const spoken_text = await speakAnswer(key, baseParams)
-
-      return {
-        spoken_text,
-        has_results: true,
-        results: [item],
-      }
-    } catch (err) {
-      console.error('[Tool:get_item_info] Error:', err)
-      const spoken_text = await speakAnswer('fallback_error')
-      return {
-        spoken_text,
-        has_results: false,
-        results: [],
-      }
-    }
-  },
-})
-
-// ---------------- HTTP + WebSocket server ----------------------------------
-
-const PORT = process.env.PORT || 8080
+// ---------------------------------------------------------------------------
+// 3. SERVER & SESSION
+// ---------------------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200)
-  res.end('Chasdei Lev Voice Gateway is running')
+  res.writeHead(200).end('Chasdei Lev Multi-Agent Gateway is running')
 })
 
 const wss = new WebSocketServer({ server })
 
 wss.on('connection', (ws, req) => {
   const { pathname } = url.parse(req.url || '')
-  console.log('[WS] New connection on path:', pathname)
-
   if (pathname !== '/twilio-stream') {
-    console.log('[WS] Unknown path, closing')
     ws.close()
     return
   }
 
-  console.log('[WS] New Twilio media stream connected')
+  console.log('[WS] New Call. Initializing Router.')
 
-  // --- Create the Realtime agent for THIS call (same as working version) ---
+  let currentSession = null
+
+  // --- TOOL DEFINITIONS (Inside connection scope to access currentSession) ---
+
+  // A. BUSINESS TOOLS (Only used by Specialists)
+  
+  const pickupTool = tool({
+    name: 'get_pickup_times',
+    description: 'Get pickup dates/times/addresses.',
+    parameters: z.object({
+      region: z.string().optional(),
+      city: z.string().optional(),
+    }),
+    execute: async ({ region, city }) => {
+      try {
+        const results = await getPickupTimes({ region, city })
+        
+        // 1. Not Found
+        if (!results.length) {
+          return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
+        }
+        
+        const first = results[0]
+        const cityLabel = first.region || first.city || city || region || 'your location'
+        
+        // 2. TBD
+        if (first.is_tbd) {
+          return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
+        }
+
+        // 3. Success
+        // NOTE: We assume speakAnswer handles the date/time formatting internally now, 
+        // or you can add the formatting helpers back here if needed.
+        const spoken_text = await speakAnswer('pickup_success', { 
+            city: cityLabel, 
+            date_spoken: first.event_date || first.date, 
+            time_window: `${first.start_time} to ${first.end_time}`, 
+            address: first.full_address 
+        })
+        
+        return { spoken_text, data: first }
+      } catch (e) {
+        console.error(e)
+        return { spoken_text: "I'm having trouble accessing the schedule right now." }
+      }
+    },
+  })
+
+  const itemInfoTool = tool({
+    name: 'get_item_info',
+    description: 'Get kashrus or description for an item.',
+    parameters: z.object({
+      item_query: z.string(),
+      focus: z.enum(['kashrus', 'description', 'both']).optional(), // made optional to match prompt flexibility
+    }),
+    execute: async ({ item_query, focus = 'both' }) => {
+      try {
+        const items = await getItemRecords({ itemQuery: item_query })
+        
+        // 1. Not Found
+        if (!items.length) return { spoken_text: await speakAnswer('item_not_found', {}) }
+        
+        // 2. Ambiguous
+        if (items.length > 1) {
+          const names = items.map(i => i.item).join(', ')
+          return { spoken_text: await speakAnswer('item_ambiguous', { options: names }) }
+        }
+
+        // 3. Success
+        const item = items[0]
+        let key = 'item_full'
+        if (focus === 'kashrus') key = 'item_kashrus_only'
+        else if (focus === 'description') key = 'item_description_only'
+
+        const spoken_text = await speakAnswer(key, {
+            item: item.item,
+            hechsher: item.hechsher || 'unknown',
+            description: item.description || ''
+        })
+        return { spoken_text, data: item }
+      } catch (e) {
+        return { spoken_text: "I'm having trouble accessing the item database." }
+      }
+    },
+  })
+
+  // B. NAVIGATION TOOLS (Used to swap agents)
+
+  // Swaps to Pickup Agent
+  const transferToPickupTool = tool({
+    name: 'transfer_to_pickup_specialist',
+    description: 'Use this when the user asks about schedule, pickup, times, or location.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('[Router] -> Pickup Specialist')
+      if (currentSession) {
+        await currentSession.update({
+            instructions: PROMPTS.pickup, // Swaps the System Prompt
+            tools: [pickupTool, transferToRouterTool] // Swaps the Tools
+        })
+      }
+      return "Transferring you to the pickup scheduler."
+    }
+  })
+
+  // Swaps to Item Agent
+  const transferToItemsTool = tool({
+    name: 'transfer_to_items_specialist',
+    description: 'Use this when the user asks about food, products, items, or hechsher/kashrus.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('[Router] -> Items Specialist')
+      if (currentSession) {
+        await currentSession.update({
+            instructions: PROMPTS.items, // Swaps the System Prompt
+            tools: [itemInfoTool, transferToRouterTool] // Swaps the Tools
+        })
+      }
+      return "Transferring you to the item specialist."
+    }
+  })
+
+  // Swaps back to Router (Main Menu)
+  const transferToRouterTool = tool({
+    name: 'transfer_to_main_menu',
+    description: 'Use this if the user asks a question you cannot answer because it is not your department.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('[Nav] -> Router')
+      if (currentSession) {
+        await currentSession.update({
+            instructions: PROMPTS.router,
+            tools: [transferToPickupTool, transferToItemsTool]
+        })
+      }
+      return "One moment, let me switch departments."
+    }
+  })
+
+  // --- INITIALIZATION (Start as Router) ---
+  
   const agent = new RealtimeAgent({
-    name: 'Chasdei Lev Pickup Assistant',
-    instructions: SYSTEM_PROMPT,   // 👈 now DB-updated global
-    tools: [pickupTool, itemInfoTool],
+    name: 'Chasdei Lev Router',
+    instructions: PROMPTS.router, 
+    tools: [transferToPickupTool, transferToItemsTool], // Router starts with only transfer tools
   })
 
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws,
   })
 
-  const session = new RealtimeSession(agent, {
+  currentSession = new RealtimeSession(agent, {
     transport: twilioTransport,
     model: 'gpt-realtime', 
-        config: {
-          audio: {
-        output: {
-          voice: 'verse',
-        },
-      },
+    config: {
+        audio: { output: { voice: 'verse' } },
     },
   })
 
-  session.on('response.completed', () => {
-    console.log('[Session] Response completed')
-  })
-
-  session.on('error', (err) => {
-    console.error('[Session] Error:', err)
-  })
+  currentSession.on('response.completed', () => console.log('[Session] Response Completed'))
+  currentSession.on('error', (err) => console.error('[Session] Error:', err))
 
   ;(async () => {
     try {
-      await session.connect({ apiKey: OPENAI_API_KEY })
-      console.log('[Session] Connected to OpenAI Realtime API')
-
-      // Same greeting trigger as in your last working version
-      session.sendMessage('GREETING_TRIGGER')
+      await currentSession.connect({ apiKey: OPENAI_API_KEY })
+      console.log('[Session] Connected to OpenAI')
+      
+      // Only the Router handles the greeting!
+      currentSession.sendMessage('GREETING_TRIGGER')
     } catch (err) {
-      console.error('[Session] Failed to connect to OpenAI:', err)
+      console.error('[Session] Connect failed:', err)
       ws.close()
     }
   })()
-
-  ws.on('close', () => {
-    console.log('[WS] Twilio stream closed')
-  })
-
-  ws.on('error', (err) => {
-    console.error('[WS] WebSocket error', err)
-  })
 })
 
 server.listen(PORT, () => {
-  console.log(`[server] Listening on port ${PORT}`)
+  console.log(`[Server] Listening on port ${PORT}`)
 })
