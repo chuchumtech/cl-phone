@@ -26,7 +26,10 @@ If your system prompt cannot be loaded from the database, you must say:
 Then end the call.
 `
 
-async function getSystemPromptForCall() {
+// This is what the agent will actually use. We’ll try to override it from Supabase:
+let SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+
+async function loadSystemPromptFromDB() {
   try {
     const { data, error } = await supabase
       .from('agent_system_prompts')
@@ -37,21 +40,26 @@ async function getSystemPromptForCall() {
 
     if (error || !data) {
       console.error('[Prompt] DB error or missing row, using DEFAULT_SYSTEM_PROMPT:', error)
-      return DEFAULT_SYSTEM_PROMPT
+      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+      return
     }
 
     if (!data.content || typeof data.content !== 'string' || !data.content.trim()) {
       console.error('[Prompt] Empty/invalid content in DB, using DEFAULT_SYSTEM_PROMPT')
-      return DEFAULT_SYSTEM_PROMPT
+      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+      return
     }
 
-    console.log('[Prompt] Using system prompt from DB, length:', data.content.length)
-    return data.content
+    SYSTEM_PROMPT = data.content
+    console.log('[Prompt] Loaded system prompt from DB, length:', SYSTEM_PROMPT.length)
   } catch (err) {
     console.error('[Prompt] Unexpected error loading system prompt, using default:', err)
-    return DEFAULT_SYSTEM_PROMPT
+    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
   }
 }
+
+// Fire once on startup (no await needed)
+loadSystemPromptFromDB()
 
 // ---------------- LOCATION HELPERS -----------------------------------------
 
@@ -359,49 +367,46 @@ wss.on('connection', (ws, req) => {
 
   console.log('[WS] New Twilio media stream connected')
 
+  // --- Create the Realtime agent for THIS call (same as working version) ---
+  const agent = new RealtimeAgent({
+    name: 'Chasdei Lev Pickup Assistant',
+    instructions: SYSTEM_PROMPT,   // 👈 now DB-updated global
+    tools: [pickupTool, itemInfoTool],
+  })
+
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws,
   })
 
-  ;(async () => {
-    try {
-      // 👇 Load the latest prompt from Supabase for THIS call
-      const systemPrompt = await getSystemPromptForCall()
-
-      // --- Create the Realtime agent for THIS call ---
-      const agent = new RealtimeAgent({
-        name: 'Chasdei Lev Pickup Assistant',
-        instructions: systemPrompt,
-        tools: [pickupTool, itemInfoTool],
-      })
-
-      const session = new RealtimeSession(agent, {
-        transport: twilioTransport,
-        model: 'gpt-realtime',
+  const session = new RealtimeSession(agent, {
+    transport: twilioTransport,
+    model: 'gpt-realtime', 
         config: {
           audio: {
-            output: {
-              voice: 'verse',
-            },
-          },
+        output: {
+          voice: 'verse',
         },
-      })
+      },
+    },
+  })
 
-      session.on('response.completed', () => {
-        console.log('[Session] Response completed')
-      })
+  session.on('response.completed', () => {
+    console.log('[Session] Response completed')
+  })
 
-      session.on('error', (err) => {
-        console.error('[Session] Error:', err)
-      })
+  session.on('error', (err) => {
+    console.error('[Session] Error:', err)
+  })
 
+  ;(async () => {
+    try {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
 
-      // Trigger Leivi’s greeting
+      // Same greeting trigger as in your last working version
       session.sendMessage('GREETING_TRIGGER')
     } catch (err) {
-      console.error('[Session] Failed to start Realtime session:', err)
+      console.error('[Session] Failed to connect to OpenAI:', err)
       ws.close()
     }
   })()
