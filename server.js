@@ -16,8 +16,7 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 // 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
 const PROMPTS = {
-  // Router now explicitly knows to extract the topic
-  router: 'You are the router. Greet the user. Listen to their request. If they ask about pickup/schedule, use "transfer_to_pickup" and pass their question in the "summary". If they ask about items/food, use "transfer_to_items" and pass their question.',
+  router: 'You are the router. Greet the user. If they ask about pickup/schedule, use "transfer_to_pickup" and put their specific question in the "summary" field. If they ask about items/food, use "transfer_to_items" and pass the "summary".',
   pickup: 'You are the Pickup Specialist. You answer questions about dates and times using the get_pickup_times tool. If asked about items, transfer to main menu.',
   items: 'You are the Item Specialist. You answer questions about food and kashrus using the get_item_info tool. If asked about pickup, transfer to main menu.'
 }
@@ -42,7 +41,7 @@ async function loadPromptsFromDB() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. REAL API HELPERS (Restored)
+// 2. REAL API HELPERS
 // ---------------------------------------------------------------------------
 
 const LOCATION_SYNONYMS = {
@@ -69,7 +68,6 @@ async function getPickupTimes({ region, city }) {
   const params = new URLSearchParams()
   if (norm.region) params.set('region', norm.region)
   
-  // REAL API CALL
   const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
   console.log('[Pickup API] Fetching:', apiUrl)
 
@@ -95,7 +93,6 @@ async function getItemRecords({ itemQuery }) {
   return data || []
 }
 
-
 // ---------------------------------------------------------------------------
 // 3. SERVER
 // ---------------------------------------------------------------------------
@@ -117,7 +114,7 @@ wss.on('connection', (ws, req) => {
   let pickupAgent = null;
   let itemsAgent = null;
 
-  // --- A. Define BUSINESS Tools (With Real Logic) ---
+  // --- A. Define BUSINESS Tools ---
 
   const pickupTool = tool({
     name: 'get_pickup_times',
@@ -191,50 +188,53 @@ wss.on('connection', (ws, req) => {
     },
   })
 
-  // --- B. Define NAVIGATION Tools (With Warm Handoff) ---
+  // --- B. Define NAVIGATION Tools ---
 
   const transferToPickup = tool({
     name: 'transfer_to_pickup',
-    description: 'Transfer caller to the pickup scheduling department.',
+    description: 'Transfer to pickup department.',
     parameters: z.object({
-      summary: z.string().describe('The specific question the user asked, e.g., "When is pickup in Lakewood?"')
+      summary: z.string().describe('The user question, e.g. "When is pickup in Lakewood?"')
     }),
     execute: async ({ summary }) => {
-      console.log(`🔄 Switching to Pickup [Context: ${summary}]`)
+      console.log(`🔄 Switching to Pickup. Context: "${summary}"`)
       
-      // 1. Swap the Agent (Brain)
       await session.updateAgent(pickupAgent) 
       
-      // 2. Inject the User's original question into the new session immediately
-      // This tricks the new agent into thinking the user just asked the question.
+      // FIX 1: Small delay to ensure agent switch registers
       if (summary) {
-        session.sendUserMessageContent([{ type: 'input_text', text: summary }])
+        setTimeout(() => {
+            if(session) session.sendMessage(summary)
+        }, 100)
       }
       
-      return "Transferring you to the pickup specialist."
+      // FIX 2: Return null so the OLD agent doesn't try to speak over the NEW agent
+      return null
     }
   })
 
   const transferToItems = tool({
     name: 'transfer_to_items',
-    description: 'Transfer caller to the item information department.',
+    description: 'Transfer to item department.',
     parameters: z.object({
-      summary: z.string().describe('The specific question the user asked, e.g., "Is the cheese chalav yisroel?"')
+      summary: z.string().describe('The user question, e.g. "Is the cheese chalav yisroel?"')
     }),
     execute: async ({ summary }) => {
-      console.log(`🔄 Switching to Items [Context: ${summary}]`)
+      console.log(`🔄 Switching to Items. Context: "${summary}"`)
       
       await session.updateAgent(itemsAgent)
 
       if (summary) {
-        session.sendUserMessageContent([{ type: 'input_text', text: summary }])
+        setTimeout(() => {
+            if(session) session.sendMessage(summary)
+        }, 100)
       }
 
-      return "Transferring you to the item specialist."
+      return null
     }
   })
 
-const transferToRouter = tool({
+  const transferToRouter = tool({
     name: 'transfer_to_main_menu',
     description: 'Go back to the main menu.',
     parameters: z.object({}),
@@ -242,14 +242,13 @@ const transferToRouter = tool({
       console.log('🔄 Switching to Router')
       await session.updateAgent(routerAgent)
       
-      // CRITICAL UPDATE: 
-      // We simulate the user saying this so the Router triggers the "Returning User" logic
-      // instead of the initial greeting.
-      if (session && session.sendMessage) {
-          session.sendMessage("I need help with something else.")
-      }
+      // FIX: Simulate message to trigger the "Returning User" prompt
+      setTimeout(() => {
+          if(session) session.sendMessage("I need help with something else.")
+      }, 100)
       
-      return "One moment, let me get the receptionist."
+      // Return null to avoid "Conversation already has response" race condition
+      return null
     }
   })
 
@@ -283,6 +282,16 @@ const transferToRouter = tool({
     }
   })
 
+  // FIX 3: GLOBAL ERROR HANDLER TO PREVENT CRASHES
+  session.on('error', (err) => {
+      console.error('[Session Error]', err)
+      // We explicitly ignore the "active response" error because it's a side effect of our fast switching
+      if (err.message && err.message.includes('conversation_already_has_active_response')) {
+          console.log('-> Ignored overlap error during handoff')
+          return
+      }
+  })
+
   session.connect({ apiKey: OPENAI_API_KEY })
     .then(() => {
       console.log('✅ Connected to OpenAI')
@@ -291,7 +300,7 @@ const transferToRouter = tool({
       }
     })
     .catch(err => {
-      console.error('[Session Error]', err)
+      console.error('[Connect Error]', err)
       ws.close()
     })
 })
