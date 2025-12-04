@@ -42,8 +42,8 @@ async function loadPromptsFromDB() {
       if (row.key === 'agent_items') PROMPTS.items = row.content
     })
     
-    // Fallback/Safety check
-    if (!PROMPTS.router) console.warn('[Prompts] Warning: Router prompt missing from DB')
+    // Fallback if DB is empty
+    if (!PROMPTS.router) PROMPTS.router = "You are the router. Greet the user and transfer them."
     
     console.log('[Prompts] Loaded agent personas from DB')
   } catch (err) {
@@ -51,11 +51,10 @@ async function loadPromptsFromDB() {
   }
 }
 
-// Load on startup
 loadPromptsFromDB()
 
 // ---------------------------------------------------------------------------
-// 2. DOMAIN HELPERS (API Calls)
+// 2. DOMAIN HELPERS
 // ---------------------------------------------------------------------------
 
 const LOCATION_SYNONYMS = {
@@ -125,46 +124,34 @@ wss.on('connection', (ws, req) => {
   }
 
   console.log('[WS] New Call. Initializing Router.')
-
   let currentSession = null
 
-  // --- TOOL DEFINITIONS (Inside connection scope to access currentSession) ---
+  // --- TOOL DEFINITIONS ---
 
-  // A. BUSINESS TOOLS (Only used by Specialists)
-  
+  // 1. BUSINESS TOOLS
   const pickupTool = tool({
     name: 'get_pickup_times',
     description: 'Get pickup dates/times/addresses.',
     parameters: z.object({
-      // FIXED: Used nullable() instead of optional() for Strict Mode
-      region: z.string().nullable().describe('The region name if mentioned, e.g. Brooklyn'),
-      city: z.string().nullable().describe('The city name if mentioned, e.g. Lakewood'),
+      region: z.string().nullable().describe('Region name e.g. Brooklyn'),
+      city: z.string().nullable().describe('City name e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
       try {
         const results = await getPickupTimes({ region, city })
-        
-        // 1. Not Found
-        if (!results.length) {
-          return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
-        }
+        if (!results.length) return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
         
         const first = results[0]
         const cityLabel = first.region || first.city || city || region || 'your location'
         
-        // 2. TBD
-        if (first.is_tbd) {
-          return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
-        }
+        if (first.is_tbd) return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
 
-        // 3. Success
         const spoken_text = await speakAnswer('pickup_success', { 
             city: cityLabel, 
             date_spoken: first.event_date || first.date, 
             time_window: `${first.start_time} to ${first.end_time}`, 
             address: first.full_address 
         })
-        
         return { spoken_text, data: first }
       } catch (e) {
         console.error(e)
@@ -178,29 +165,21 @@ wss.on('connection', (ws, req) => {
     description: 'Get kashrus or description for an item.',
     parameters: z.object({
       item_query: z.string(),
-      // FIXED: Removed optional(), forced the enum to be required. 
-      focus: z.enum(['kashrus', 'description', 'both']).describe('Whether the user wants kashrus info, description, or both.'), 
+      focus: z.enum(['kashrus', 'description', 'both']),
     }),
     execute: async ({ item_query, focus }) => {
       try {
         const items = await getItemRecords({ itemQuery: item_query })
-        
-        // 1. Not Found
         if (!items.length) return { spoken_text: await speakAnswer('item_not_found', {}) }
         
-        // 2. Ambiguous
         if (items.length > 1) {
           const names = items.map(i => i.item).join(', ')
           return { spoken_text: await speakAnswer('item_ambiguous', { options: names }) }
         }
 
-        // 3. Success
         const item = items[0]
-        let key = 'item_full'
-        if (focus === 'kashrus') key = 'item_kashrus_only'
-        else if (focus === 'description') key = 'item_description_only'
-        // Default to 'item_full' if 'both' is passed
-
+        let key = focus === 'kashrus' ? 'item_kashrus_only' : focus === 'description' ? 'item_description_only' : 'item_full'
+        
         const spoken_text = await speakAnswer(key, {
             item: item.item,
             hechsher: item.hechsher || 'unknown',
@@ -213,65 +192,86 @@ wss.on('connection', (ws, req) => {
     },
   })
 
-  // B. NAVIGATION TOOLS (Used to swap agents)
-
-  // Swaps to Pickup Agent
+  // 2. NAVIGATION TOOLS
   const transferToPickupTool = tool({
     name: 'transfer_to_pickup_specialist',
-    description: 'Use this when the user asks about schedule, pickup, times, or location.',
+    description: 'Transfer caller to the pickup scheduling department.',
     parameters: z.object({}),
     execute: async () => {
       console.log('[Router] -> Pickup Specialist')
-      if (currentSession) {
-        await currentSession.update({
-            instructions: PROMPTS.pickup, // Swaps the System Prompt
-            tools: [pickupTool, transferToRouterTool] // Swaps the Tools
-        })
+      try {
+        if (currentSession) {
+            // Update session with NEW instructions and NEW tools
+            await currentSession.update({
+                instructions: PROMPTS.pickup,
+                tools: [pickupTool, transferToRouterTool] // We expose ONLY these to OpenAI
+            })
+        }
+        return "Transferring you to the pickup scheduler."
+      } catch (err) {
+        console.error('[Transfer Error]', err)
+        return "I'm having trouble connecting you."
       }
-      return "Transferring you to the pickup scheduler."
     }
   })
 
-  // Swaps to Item Agent
   const transferToItemsTool = tool({
     name: 'transfer_to_items_specialist',
-    description: 'Use this when the user asks about food, products, items, or hechsher/kashrus.',
+    description: 'Transfer caller to the product and kashrus department.',
     parameters: z.object({}),
     execute: async () => {
       console.log('[Router] -> Items Specialist')
-      if (currentSession) {
-        await currentSession.update({
-            instructions: PROMPTS.items, // Swaps the System Prompt
-            tools: [itemInfoTool, transferToRouterTool] // Swaps the Tools
-        })
+      try {
+        if (currentSession) {
+            await currentSession.update({
+                instructions: PROMPTS.items,
+                tools: [itemInfoTool, transferToRouterTool]
+            })
+        }
+        return "Transferring you to the item specialist."
+      } catch (err) {
+        console.error('[Transfer Error]', err)
+        return "I'm having trouble connecting you."
       }
-      return "Transferring you to the item specialist."
     }
   })
 
-  // Swaps back to Router (Main Menu)
   const transferToRouterTool = tool({
     name: 'transfer_to_main_menu',
-    description: 'Use this if the user asks a question you cannot answer because it is not your department.',
+    description: 'Return to the main menu.',
     parameters: z.object({}),
     execute: async () => {
       console.log('[Nav] -> Router')
-      if (currentSession) {
-        await currentSession.update({
-            instructions: PROMPTS.router,
-            tools: [transferToPickupTool, transferToItemsTool]
-        })
+      try {
+        if (currentSession) {
+            await currentSession.update({
+                instructions: PROMPTS.router,
+                tools: [transferToPickupTool, transferToItemsTool]
+            })
+        }
+        return "One moment, let me switch departments."
+      } catch (err) {
+        console.error('[Transfer Error]', err)
+        return "I'm having trouble switching departments."
       }
-      return "One moment, let me switch departments."
     }
   })
 
-  // --- INITIALIZATION (Start as Router) ---
+  // --- INITIALIZATION ---
   
+  // CRITICAL FIX: Register ALL tools here so the Agent knows how to execute them.
+  const allTools = [
+    pickupTool, 
+    itemInfoTool, 
+    transferToPickupTool, 
+    transferToItemsTool, 
+    transferToRouterTool
+  ]
+
   const agent = new RealtimeAgent({
-    name: 'Chasdei Lev Router',
+    name: 'Chasdei Lev Assistant',
     instructions: PROMPTS.router, 
-    tools: [transferToPickupTool, transferToItemsTool], // Router starts with only transfer tools
+    tools: allTools, // Register EVERYTHING locally
   })
 
   const twilioTransport = new TwilioRealtimeTransportLayer({
@@ -283,6 +283,8 @@ wss.on('connection', (ws, req) => {
     model: 'gpt-realtime', 
     config: {
         audio: { output: { voice: 'verse' } },
+        // IMPORTANT: Initialize OpenAI with ONLY the Router tools visible
+        tools: [transferToPickupTool, transferToItemsTool] 
     },
   })
 
@@ -294,7 +296,7 @@ wss.on('connection', (ws, req) => {
       await currentSession.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
       
-      // Only the Router handles the greeting!
+      // Start conversation
       currentSession.sendMessage('GREETING_TRIGGER')
     } catch (err) {
       console.error('[Session] Connect failed:', err)
