@@ -15,7 +15,6 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 // ---------------------------------------------------------------------------
 // 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
-
 const PROMPTS = {
   router: 'You are the router...',
   pickup: 'You are the pickup specialist...',
@@ -42,14 +41,15 @@ async function loadPromptsFromDB() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. HELPER: Tool Formatter
+// 2. HELPER: Tool Formatter (CRITICAL)
 // ---------------------------------------------------------------------------
-// The OpenAI API expects raw JSON for tools, but the SDK gives us objects.
-// This helper ensures we send the correct format during updates.
-function formatToolsForUpdate(toolList) {
+// We must strip the 'execute' function when sending updates to OpenAI, 
+// otherwise the API will reject the JSON.
+function formatForOpenAI(toolList) {
   return toolList.map(t => {
-    if (t.type === 'function') return t
+    // If it has a 'definition' property (standard SDK tool), return that.
     if (t.definition) return { type: 'function', ...t.definition }
+    // Fallback if it's already raw JSON
     return t
   })
 }
@@ -70,10 +70,9 @@ wss.on('connection', (ws, req) => {
   
   console.log('[WS] New Connection')
 
-  let session = null // Capture session in scope
-  let routerAgent = null // Capture router in scope so "Back" tool can see it
+  let session = null 
 
-  // --- A. Define Business Tools ---
+  // --- A. Define CORE Tools ---
 
   const pickupTool = tool({
     name: 'get_pickup_times',
@@ -83,7 +82,7 @@ wss.on('connection', (ws, req) => {
       city: z.string().nullable().describe('City name e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
-      // ... (Add your API logic here) ...
+      // Logic from your original file
       const spoken_text = await speakAnswer('pickup_success', { 
           city: city || region || 'your location', 
           date_spoken: "Tuesday", 
@@ -102,50 +101,25 @@ wss.on('connection', (ws, req) => {
       focus: z.enum(['kashrus', 'description', 'both']),
     }),
     execute: async ({ item_query }) => {
-       // ... (Add your API logic here) ...
        const spoken_text = await speakAnswer('item_full', {
            item: item_query,
            hechsher: "CRC",
-           description: "Tasty cheese"
+           description: "Available"
        })
        return { spoken_text }
     },
   })
 
-  // --- B. Define Navigation Tools (The "Handoffs") ---
+  // --- B. Define NAVIGATION Tools ---
 
-  // 1. Tool to go BACK (Needs 'routerAgent' which is defined later)
-  const transferToRouter = tool({
-    name: 'transfer_to_main_menu',
-    description: 'Go back to the main menu.',
-    parameters: z.object({}),
-    execute: async () => {
-      console.log('🔄 Switching to Router')
-      if (session && routerAgent) {
-        // Manually update the session with the Router's configuration
-        await session.client.updateSession({
-          instructions: routerAgent.instructions,
-          tools: formatToolsForUpdate(routerAgent.tools)
-        })
-      }
-      return "Transferring you to the main menu."
-    }
-  })
+  // NOTE: We define the "Target States" as simple arrays of tools.
+  // We do NOT create new Agent classes here, we just hold the configs.
+  
+  const pickupToolsList = [pickupTool] // Will add 'back' button later
+  const itemsToolsList = [itemInfoTool]
+  const routerToolsList = [] // Will add 'transfer' buttons later
 
-  // 2. Define Specialists (Now we can pass transferToRouter in the constructor!)
-  const pickupAgent = new RealtimeAgent({
-    name: 'Pickup Specialist',
-    instructions: PROMPTS.pickup,
-    tools: [pickupTool, transferToRouter], // <--- No .addTool needed!
-  })
-
-  const itemsAgent = new RealtimeAgent({
-    name: 'Item Specialist',
-    instructions: PROMPTS.items,
-    tools: [itemInfoTool, transferToRouter], // <--- No .addTool needed!
-  })
-
-  // 3. Tools to go FORWARD (Use the specialists we just made)
+  // 1. Transfer TO Pickup
   const transferToPickup = tool({
     name: 'transfer_to_pickup',
     description: 'Transfer to pickup department.',
@@ -153,15 +127,19 @@ wss.on('connection', (ws, req) => {
     execute: async () => {
       console.log('🔄 Switching to Pickup')
       if (session) {
+        // We add the "Back" tool to the list dynamically here
+        const toolsForPickup = [...pickupToolsList, transferToRouter]
+        
         await session.client.updateSession({
-            instructions: pickupAgent.instructions,
-            tools: formatToolsForUpdate(pickupAgent.tools)
+            instructions: PROMPTS.pickup,
+            tools: formatForOpenAI(toolsForPickup)
         })
       }
       return "Transferring you to the pickup specialist."
     }
   })
 
+  // 2. Transfer TO Items
   const transferToItems = tool({
     name: 'transfer_to_items',
     description: 'Transfer to item department.',
@@ -169,32 +147,66 @@ wss.on('connection', (ws, req) => {
     execute: async () => {
       console.log('🔄 Switching to Items')
       if (session) {
+        const toolsForItems = [...itemsToolsList, transferToRouter]
+        
         await session.client.updateSession({
-            instructions: itemsAgent.instructions,
-            tools: formatToolsForUpdate(itemsAgent.tools)
+            instructions: PROMPTS.items,
+            tools: formatForOpenAI(toolsForItems)
         })
       }
       return "Transferring you to the item specialist."
     }
   })
 
-  // --- C. Finally, Define the Router Agent ---
-  // Now we assign the variable we declared at the top
-  routerAgent = new RealtimeAgent({
-    name: 'Router',
-    instructions: PROMPTS.router,
-    tools: [transferToPickup, transferToItems],
+  // 3. Transfer BACK to Router
+  const transferToRouter = tool({
+    name: 'transfer_to_main_menu',
+    description: 'Go back to the main menu.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('🔄 Switching to Router')
+      if (session) {
+        const toolsForRouter = [transferToPickup, transferToItems]
+        
+        await session.client.updateSession({
+          instructions: PROMPTS.router,
+          tools: formatForOpenAI(toolsForRouter)
+        })
+      }
+      return "Transferring you to the main menu."
+    }
+  })
+
+  // --- C. The "Super Agent" Logic ---
+  
+  // CRITICAL STEP:
+  // The 'RealtimeAgent' we initialize the session with MUST have EVERY tool.
+  // This ensures that if OpenAI sends a function call, the local code can run it.
+  // We control "Access" via the updateSession call, not by removing tools locally.
+
+  const allTools = [
+    pickupTool,
+    itemInfoTool,
+    transferToPickup,
+    transferToItems,
+    transferToRouter
+  ]
+
+  const masterAgent = new RealtimeAgent({
+    name: 'Chasdei Lev Logic Core',
+    instructions: PROMPTS.router, // Default start prompt
+    tools: allTools,              // REGISTER EVERYTHING LOCALLY
   })
 
   // --- D. Start Session ---
 
-  session = new RealtimeSession(routerAgent, {
+  session = new RealtimeSession(masterAgent, {
     transport: new TwilioRealtimeTransportLayer({ twilioWebSocket: ws }),
     model: 'gpt-realtime',
     config: {
       audio: { output: { voice: 'verse' } },
-      // Important: Start ONLY with Router tools visible
-      tools: formatToolsForUpdate(routerAgent.tools) 
+      // INITIAL VISIBILITY: Only show Router tools to OpenAI at start
+      tools: formatForOpenAI([transferToPickup, transferToItems]) 
     }
   })
 
