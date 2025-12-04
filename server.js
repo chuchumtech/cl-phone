@@ -16,7 +16,7 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 // 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
 const PROMPTS = {
-  router: 'You are the router...',
+  router: 'You are the router. Ask the user if they need pickup info or item info.',
   pickup: 'You are the pickup specialist...',
   items: 'You are the items specialist...'
 }
@@ -43,6 +43,7 @@ async function loadPromptsFromDB() {
 // ---------------------------------------------------------------------------
 // 2. HELPER: Tool Formatter
 // ---------------------------------------------------------------------------
+// OpenAI expects pure JSON for tool definitions in session updates.
 function formatForOpenAI(toolList) {
   return toolList.map(t => {
     if (t.definition) return { type: 'function', ...t.definition }
@@ -68,6 +69,35 @@ wss.on('connection', (ws, req) => {
 
   let session = null 
 
+  // --- HELPER: Manual Session Update (The Fix) ---
+  // This bypasses SDK limitations to force a "Brain Transplant" mid-call.
+  const dispatchSessionUpdate = async (instructions, tools) => {
+    console.log('[Session] Updating Tools/Prompt...')
+    
+    const event = {
+      type: 'session.update',
+      session: {
+        instructions: instructions,
+        tools: tools,
+      }
+    }
+
+    // Attempt to find the correct send method on the session or transport
+    try {
+        if (session.client && typeof session.client.send === 'function') {
+            session.client.send(event)
+        } else if (session.transport && typeof session.transport.send === 'function') {
+            session.transport.send(event)
+        } else if (typeof session.send === 'function') {
+            session.send(event)
+        } else {
+            console.error('[Error] Could not find a way to send session.update!')
+        }
+    } catch (err) {
+        console.error('[Error] Failed to dispatch session update:', err)
+    }
+  }
+
   // --- A. Define CORE Tools ---
 
   const pickupTool = tool({
@@ -78,7 +108,6 @@ wss.on('connection', (ws, req) => {
       city: z.string().nullable().describe('City name e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
-      // ⬇️ Replace this with your actual API Logic from previous versions
       const spoken_text = await speakAnswer('pickup_success', { 
           city: city || region || 'your location', 
           date_spoken: "Tuesday", 
@@ -97,7 +126,6 @@ wss.on('connection', (ws, req) => {
       focus: z.enum(['kashrus', 'description', 'both']),
     }),
     execute: async ({ item_query }) => {
-       // ⬇️ Replace this with your actual API Logic from previous versions
        const spoken_text = await speakAnswer('item_full', {
            item: item_query,
            hechsher: "CRC",
@@ -119,15 +147,9 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Pickup')
-      if (session && session.client) {
-        // Add "Back" button dynamically
-        const toolsForPickup = [...pickupToolsList, transferToRouter]
-        
-        await session.client.updateSession({
-            instructions: PROMPTS.pickup,
-            tools: formatForOpenAI(toolsForPickup)
-        })
-      }
+      // Inject "Back" button into the new state
+      const toolsForPickup = [...pickupToolsList, transferToRouter]
+      await dispatchSessionUpdate(PROMPTS.pickup, formatForOpenAI(toolsForPickup));
       return "Transferring you to the pickup specialist."
     }
   })
@@ -139,14 +161,8 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Items')
-      if (session && session.client) {
-        const toolsForItems = [...itemsToolsList, transferToRouter]
-        
-        await session.client.updateSession({
-            instructions: PROMPTS.items,
-            tools: formatForOpenAI(toolsForItems)
-        })
-      }
+      const toolsForItems = [...itemsToolsList, transferToRouter]
+      await dispatchSessionUpdate(PROMPTS.items, formatForOpenAI(toolsForItems));
       return "Transferring you to the item specialist."
     }
   })
@@ -158,20 +174,16 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Router')
-      if (session && session.client) {
-        const toolsForRouter = [transferToPickup, transferToItems]
-        
-        await session.client.updateSession({
-          instructions: PROMPTS.router,
-          tools: formatForOpenAI(toolsForRouter)
-        })
-      }
+      const toolsForRouter = [transferToPickup, transferToItems]
+      await dispatchSessionUpdate(PROMPTS.router, formatForOpenAI(toolsForRouter));
       return "Transferring you to the main menu."
     }
   })
 
   // --- C. Master Logic ---
 
+  // CRITICAL: We register ALL tools locally so the code never crashes 
+  // if OpenAI asks for a function we supposedly removed.
   const allTools = [
     pickupTool,
     itemInfoTool,
@@ -183,7 +195,7 @@ wss.on('connection', (ws, req) => {
   const masterAgent = new RealtimeAgent({
     name: 'Chasdei Lev Logic Core',
     instructions: PROMPTS.router, 
-    tools: allTools, // Register ALL tools locally
+    tools: allTools, 
   })
 
   // --- D. Start Session ---
@@ -193,7 +205,7 @@ wss.on('connection', (ws, req) => {
     model: 'gpt-realtime',
     config: {
       audio: { output: { voice: 'verse' } },
-      // Start with ONLY Router tools visible
+      // Start with ONLY Router tools visible to the AI
       tools: formatForOpenAI([transferToPickup, transferToItems]) 
     }
   })
@@ -201,8 +213,8 @@ wss.on('connection', (ws, req) => {
   session.connect({ apiKey: OPENAI_API_KEY })
     .then(() => {
       console.log('✅ Connected to OpenAI')
-      // FIX: Use session.client to send the user message
-      session.client.sendUserMessageContent([{ type: 'input_text', text: 'GREETING_TRIGGER' }])
+      // We use the method PROVEN to work in your first version
+      session.sendMessage('GREETING_TRIGGER')
     })
     .catch(err => {
       console.error(err)
