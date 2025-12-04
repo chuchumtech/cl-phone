@@ -324,7 +324,7 @@ wss.on('connection', (ws, req) => {
             threshold: 0.6, // 0.6 = harder to interrupt
             prefix_padding_ms: 300,
             silence_duration_ms: 600
-          },
+          }
           audio: {
         output: {
           voice: 'verse',
