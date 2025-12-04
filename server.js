@@ -318,13 +318,6 @@ wss.on('connection', (ws, req) => {
     transport: twilioTransport,
     model: 'gpt-4o-realtime-preview-2024-10-01', 
         config: {
-          // 2. Server VAD with High Threshold (Fixes Noise/Interruption)
-          turnDetection: {
-            type: 'server_vad',
-            threshold: 0.6, // 0.6 = harder to interrupt
-            prefix_padding_ms: 300,
-            silence_duration_ms: 600
-          }
           audio: {
         output: {
           voice: 'verse',
