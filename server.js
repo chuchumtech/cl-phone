@@ -16,7 +16,8 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 // 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
 const PROMPTS = {
-  router: 'You are the router. Greet the user. If they need pickup info, transfer to Pickup. If items, transfer to Items. Do not answer questions yourself.',
+  // Router now explicitly knows to extract the topic
+  router: 'You are the router. Greet the user. Listen to their request. If they ask about pickup/schedule, use "transfer_to_pickup" and pass their question in the "summary". If they ask about items/food, use "transfer_to_items" and pass their question.',
   pickup: 'You are the Pickup Specialist. You answer questions about dates and times using the get_pickup_times tool. If asked about items, transfer to main menu.',
   items: 'You are the Item Specialist. You answer questions about food and kashrus using the get_item_info tool. If asked about pickup, transfer to main menu.'
 }
@@ -41,7 +42,62 @@ async function loadPromptsFromDB() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. SERVER
+// 2. REAL API HELPERS (Restored)
+// ---------------------------------------------------------------------------
+
+const LOCATION_SYNONYMS = {
+  'boro park': { region: 'Brooklyn' },
+  boropark: { region: 'Brooklyn' },
+  flatbush: { region: 'Brooklyn' },
+  brooklyn: { region: 'Brooklyn' },
+  lakewood: { region: 'Lakewood' },
+  monsey: { region: 'Monsey' },
+  'five towns': { region: 'Five Towns' },
+}
+
+function normalizeLocation(raw) {
+  if (!raw) return {}
+  const key = raw.toLowerCase().trim()
+  const mapped = LOCATION_SYNONYMS[key]
+  if (mapped?.region) return { region: mapped.region }
+  if (mapped?.city) return { region: mapped.city }
+  return { region: raw }
+}
+
+async function getPickupTimes({ region, city }) {
+  const norm = normalizeLocation(city || region)
+  const params = new URLSearchParams()
+  if (norm.region) params.set('region', norm.region)
+  
+  // REAL API CALL
+  const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
+  console.log('[Pickup API] Fetching:', apiUrl)
+
+  const res = await fetch(apiUrl)
+  if (!res.ok) throw new Error('Pickup API error')
+  const json = await res.json()
+  return json.results || []
+}
+
+async function getItemRecords({ itemQuery }) {
+  if (!itemQuery || !itemQuery.trim()) return []
+  const search = itemQuery.trim()
+  const { data, error } = await supabase
+    .from('cl_items_kashrus')
+    .select('*')
+    .or(`item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`)
+    .limit(5)
+  
+  if (error) {
+    console.error('[DB] Item search error:', error)
+    return []
+  }
+  return data || []
+}
+
+
+// ---------------------------------------------------------------------------
+// 3. SERVER
 // ---------------------------------------------------------------------------
 
 await loadPromptsFromDB()
@@ -56,15 +112,12 @@ wss.on('connection', (ws, req) => {
   
   console.log('[WS] New Connection')
 
-  // --- VARIABLES (The Closure Trick) ---
-  // We declare these upfront so the tools can reference them 
-  // even though they aren't initialized yet.
   let session = null;
   let routerAgent = null;
   let pickupAgent = null;
   let itemsAgent = null;
 
-  // --- A. Define BUSINESS Tools ---
+  // --- A. Define BUSINESS Tools (With Real Logic) ---
 
   const pickupTool = tool({
     name: 'get_pickup_times',
@@ -74,13 +127,32 @@ wss.on('connection', (ws, req) => {
       city: z.string().nullable().describe('City name e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
-      const spoken_text = await speakAnswer('pickup_success', { 
-          city: city || region || 'your location', 
-          date_spoken: "Tuesday", 
-          time_window: "5pm to 9pm", 
-          address: "123 Main St" 
-      }) 
-      return { spoken_text }
+      try {
+        const results = await getPickupTimes({ region, city })
+        
+        if (!results.length) {
+          return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
+        }
+        
+        const first = results[0]
+        const cityLabel = first.region || first.city || city || region || 'your location'
+        
+        if (first.is_tbd) {
+          return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
+        }
+
+        const spoken_text = await speakAnswer('pickup_success', { 
+            city: cityLabel, 
+            date_spoken: first.event_date || first.date, 
+            time_window: `${first.start_time} to ${first.end_time}`, 
+            address: first.full_address 
+        })
+        
+        return { spoken_text, data: first }
+      } catch (e) {
+        console.error(e)
+        return { spoken_text: "I'm having trouble accessing the schedule right now." }
+      }
     },
   })
 
@@ -91,26 +163,54 @@ wss.on('connection', (ws, req) => {
       item_query: z.string(),
       focus: z.enum(['kashrus', 'description', 'both']),
     }),
-    execute: async ({ item_query }) => {
-       const spoken_text = await speakAnswer('item_full', {
-           item: item_query,
-           hechsher: "CRC",
-           description: "Available"
-       })
-       return { spoken_text }
+    execute: async ({ item_query, focus }) => {
+      try {
+        const items = await getItemRecords({ itemQuery: item_query })
+        
+        if (!items.length) return { spoken_text: await speakAnswer('item_not_found', {}) }
+        
+        if (items.length > 1) {
+          const names = items.map(i => i.item).join(', ')
+          return { spoken_text: await speakAnswer('item_ambiguous', { options: names }) }
+        }
+
+        const item = items[0]
+        let key = 'item_full'
+        if (focus === 'kashrus') key = 'item_kashrus_only'
+        else if (focus === 'description') key = 'item_description_only'
+
+        const spoken_text = await speakAnswer(key, {
+            item: item.item,
+            hechsher: item.hechsher || 'unknown',
+            description: item.description || ''
+        })
+        return { spoken_text, data: item }
+      } catch (e) {
+        return { spoken_text: "I'm having trouble accessing the item database." }
+      }
     },
   })
 
-  // --- B. Define NAVIGATION Tools ---
+  // --- B. Define NAVIGATION Tools (With Warm Handoff) ---
 
   const transferToPickup = tool({
     name: 'transfer_to_pickup',
     description: 'Transfer caller to the pickup scheduling department.',
-    parameters: z.object({}),
-    execute: async () => {
-      console.log('🔄 Switching to Pickup Agent')
-      // Uses the 'pickupAgent' variable which will be defined by the time this runs
+    parameters: z.object({
+      summary: z.string().describe('The specific question the user asked, e.g., "When is pickup in Lakewood?"')
+    }),
+    execute: async ({ summary }) => {
+      console.log(`🔄 Switching to Pickup [Context: ${summary}]`)
+      
+      // 1. Swap the Agent (Brain)
       await session.updateAgent(pickupAgent) 
+      
+      // 2. Inject the User's original question into the new session immediately
+      // This tricks the new agent into thinking the user just asked the question.
+      if (summary) {
+        session.sendUserMessageContent([{ type: 'input_text', text: summary }])
+      }
+      
       return "Transferring you to the pickup specialist."
     }
   })
@@ -118,10 +218,18 @@ wss.on('connection', (ws, req) => {
   const transferToItems = tool({
     name: 'transfer_to_items',
     description: 'Transfer caller to the item information department.',
-    parameters: z.object({}),
-    execute: async () => {
-      console.log('🔄 Switching to Items Agent')
+    parameters: z.object({
+      summary: z.string().describe('The specific question the user asked, e.g., "Is the cheese chalav yisroel?"')
+    }),
+    execute: async ({ summary }) => {
+      console.log(`🔄 Switching to Items [Context: ${summary}]`)
+      
       await session.updateAgent(itemsAgent)
+
+      if (summary) {
+        session.sendUserMessageContent([{ type: 'input_text', text: summary }])
+      }
+
       return "Transferring you to the item specialist."
     }
   })
@@ -131,32 +239,30 @@ wss.on('connection', (ws, req) => {
     description: 'Go back to the main menu/receptionist.',
     parameters: z.object({}),
     execute: async () => {
-      console.log('🔄 Switching to Router Agent')
+      console.log('🔄 Switching to Router')
       await session.updateAgent(routerAgent)
       return "One moment, let me get the receptionist."
     }
   })
 
   // --- C. Initialize Agents ---
-  // Now we create the agents using the tools we just defined.
-  // Note: We do NOT use .addTool(). We pass the array in the constructor.
 
   pickupAgent = new RealtimeAgent({
     name: 'Pickup Specialist',
     instructions: PROMPTS.pickup,
-    tools: [pickupTool, transferToRouter], // Has the business tool + back button
+    tools: [pickupTool, transferToRouter], 
   })
 
   itemsAgent = new RealtimeAgent({
     name: 'Item Specialist',
     instructions: PROMPTS.items,
-    tools: [itemInfoTool, transferToRouter], // Has the business tool + back button
+    tools: [itemInfoTool, transferToRouter], 
   })
 
   routerAgent = new RealtimeAgent({
     name: 'Router',
     instructions: PROMPTS.router,
-    tools: [transferToPickup, transferToItems], // Can only transfer
+    tools: [transferToPickup, transferToItems], 
   })
 
   // --- D. Start Session ---
