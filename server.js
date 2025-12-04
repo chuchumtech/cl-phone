@@ -25,7 +25,7 @@ Then end the call.
 
 // --- 1. Database & Template Helpers (Self-Contained Scalability) ------------
 
-async function getSystemPrompt() {
+async function loadSystemPromptFromDB() {
   try {
     const { data, error } = await supabase
       .from('agent_system_prompts')
@@ -35,15 +35,28 @@ async function getSystemPrompt() {
       .single()
 
     if (error || !data) {
-      console.error('[Prompt] Error loading system prompt:', error)
-      return DEFAULT_SYSTEM_PROMPT
+      console.error('[Prompt] DB error or missing row, using DEFAULT_SYSTEM_PROMPT:', error)
+      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+      return
     }
-    return data.content
+
+    if (!data.content || typeof data.content !== 'string' || !data.content.trim()) {
+      console.error('[Prompt] Empty/invalid content in DB, using DEFAULT_SYSTEM_PROMPT')
+      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+      return
+    }
+
+    SYSTEM_PROMPT = data.content
+    console.log('[Prompt] Loaded system prompt from DB, length:', SYSTEM_PROMPT.length)
   } catch (err) {
-    console.error('[Prompt] Unexpected error loading system prompt:', err)
-    return DEFAULT_SYSTEM_PROMPT
+    console.error('[Prompt] Unexpected error loading system prompt, using default:', err)
+    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
   }
 }
+
+// Fire once on startup (no await needed)
+loadSystemPromptFromDB()
+
 
 async function getTemplate(key) {
   const { data, error } = await supabase
@@ -182,24 +195,17 @@ wss.on('connection', (ws, req) => {
     ws.close()
     return
   }
+ console.log('[WS] New Twilio media stream connected')
 
+  // --- Create the Realtime agent for THIS call (same as working version) ---
+  const agent = new RealtimeAgent({
+    name: 'Chasdei Lev Pickup Assistant',
+    instructions: SYSTEM_PROMPT,   // 👈 now DB-updated global
+    tools: [pickupTool],
+  })
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws,
   })
-
-  // Start Async Logic
-  ;(async () => {
-    try {
-      // Load Prompt dynamically (Scalable!)
-      const instructions = await getSystemPrompt()
-      console.log(`[System] Prompt loaded (${instructions.length} chars)`)
-
-      const agent = new RealtimeAgent({
-        name: 'Chasdei Lev Pickup Assistant',
-        instructions,
-        tools: [pickupTool],
-      })
-
       // --- CRITICAL CONFIGURATION -------------------------------------------
       const session = new RealtimeSession(agent, {
         transport: twilioTransport,
