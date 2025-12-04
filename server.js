@@ -116,6 +116,27 @@ async function getPickupTimes({ region, city }) {
   return json.results || []
 }
 
+async function getItemRecords({ itemQuery }) {
+  if (!itemQuery || !itemQuery.trim()) {
+    return []
+  }
+
+  const search = itemQuery.trim()
+
+  // Try to match by item name or description
+  const { data, error } = await supabase
+    .from('cl_items_kashrus') // 👈 change if your table name is different
+    .select('*')
+    .or(`item.ilike.%${search}%,description.ilike.%${search}%`)
+    .limit(5)
+
+  if (error) {
+    console.error('[Items] Error fetching item info:', error)
+    return []
+  }
+
+  return data || []
+}
 // ---------------- TOOL: pickup-times using speakAnswer ----------------------
 
 function formatTime24To12(t) {
@@ -235,6 +256,96 @@ const pickupTool = tool({
   },
 })
 
+const itemInfoTool = tool({
+  name: 'get_item_info',
+  description:
+    'Get kashrus/hechsher details and a basic description for a specific Chasdei Lev item.',
+  parameters: z.object({
+    item_query: z
+      .string()
+      .describe('What the caller says about the item, e.g. "cheese pack", "Haolam cheese", "salmon".'),
+    focus: z
+      .enum(['kashrus', 'description', 'both'])
+      .optional()
+      .describe(
+        'What the caller is primarily asking about: kashrus, description, or both. If unsure, use "both".'
+      ),
+  }),
+  execute: async ({ item_query, focus }) => {
+    try {
+      console.log('[Tool:get_item_info] Called with:', { item_query, focus })
+
+      const items = await getItemRecords({ itemQuery: item_query })
+
+      if (!items || !items.length) {
+        const spoken_text = await speakAnswer('item_not_found', {})
+        return {
+          spoken_text,
+          has_results: false,
+          results: [],
+        }
+      }
+
+      // If multiple possible items, ask which one
+      if (items.length > 1) {
+        // Build short list: "Cheese Pack A, Cheese Pack B, and Salmon"
+        const names = items.map((it) => it.item).filter(Boolean)
+        let optionsText = ''
+
+        if (names.length === 1) {
+          optionsText = names[0]
+        } else if (names.length === 2) {
+          optionsText = `${names[0]} and ${names[1]}`
+        } else {
+          const last = names[names.length - 1]
+          const rest = names.slice(0, -1)
+          optionsText = `${rest.join(', ')}, and ${last}`
+        }
+
+        const spoken_text = await speakAnswer('item_ambiguous', {
+          options: optionsText,
+        })
+
+        return {
+          spoken_text,
+          has_results: false,
+          results: items,
+        }
+      }
+
+      // Exactly one item found
+      const item = items[0]
+
+      const baseParams = {
+        item: item.item || item_query,
+        hechsher: item.hechsher || 'not specified',
+        description: item.description || 'no description available',
+      }
+
+      // Decide which template to use based on focus
+      let key = 'item_full'
+      if (focus === 'kashrus') key = 'item_kashrus_only'
+      else if (focus === 'description') key = 'item_description_only'
+
+      const spoken_text = await speakAnswer(key, baseParams)
+
+      return {
+        spoken_text,
+        has_results: true,
+        results: [item],
+      }
+    } catch (err) {
+      console.error('[Tool:get_item_info] Error:', err)
+      const spoken_text = await speakAnswer('fallback_error')
+      return {
+        spoken_text,
+        has_results: false,
+        results: [],
+      }
+    }
+  },
+})
+
 // ---------------- HTTP + WebSocket server ----------------------------------
 
 const PORT = process.env.PORT || 8080
@@ -262,7 +373,7 @@ wss.on('connection', (ws, req) => {
   const agent = new RealtimeAgent({
     name: 'Chasdei Lev Pickup Assistant',
     instructions: SYSTEM_PROMPT,   // 👈 now DB-updated global
-    tools: [pickupTool],
+    tools: [pickupTool, itemInfoTool],
   })
 
   const twilioTransport = new TwilioRealtimeTransportLayer({
