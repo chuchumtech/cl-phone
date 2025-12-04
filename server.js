@@ -1,7 +1,7 @@
+import dotenv from 'dotenv'
 import http from 'http'
 import url from 'url'
 import { WebSocketServer } from 'ws'
-import dotenv from 'dotenv'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
@@ -36,7 +36,7 @@ async function getSystemPrompt() {
   }
 }
 
-dotenv.config()
+//dotenv.config()
 
 const { OPENAI_API_KEY } = process.env
 if (!OPENAI_API_KEY) {
@@ -241,6 +241,7 @@ wss.on('connection', (ws, req) => {
     try {
       // 👇 Load system prompt from Supabase (or fall back to default)
       const instructions = await getSystemPrompt()
+      console.log('[Prompt] Using instructions length:', instructions.length)
 
       // --- Create the Realtime agent for THIS call -------------------------
       const agent = new RealtimeAgent({
