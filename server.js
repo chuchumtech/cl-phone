@@ -198,6 +198,7 @@ wss.on('connection', (ws, req) => {
         transport: twilioTransport,
         model: 'gpt-4o-realtime-preview-2024-10-01', 
         config: {
+          // 👇 Correct key (camelCase) + Strong VAD settings
           turnDetection: {
             type: 'server_vad',
             threshold: 0.6, // Higher = Ignores background noise
@@ -218,24 +219,22 @@ wss.on('connection', (ws, req) => {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
 
-      // --- CRITICAL FIX: FORCE THE GREETING ---
+      // --- CRITICAL FIX: Trigger Greeting and FORCE response ---
       setTimeout(() => {
           console.log('[Session] Triggering greeting...')
           
-          // 1. Send the text trigger
-          session.sendUserMessageContent([{ type: 'input_text', text: 'GREETING_TRIGGER' }])
+          // 1. Send the text trigger using the standard method
+          session.sendMessage('GREETING_TRIGGER');
           
-          // 2. FORCE response generation (Required because VAD is waiting for silence)
-          if (session.client && typeof session.client.createResponse === 'function') {
-             session.client.createResponse();
-          } else {
-             // Fallback for different SDK versions: try to force a response via raw event
-             // This uses the underlying client to send "response.create"
-             try {
-                session.client.realtime.send('response.create', { response: {} })
-             } catch(e) {
-                console.log("Could not force response via raw client, relying on VAD timeout")
-             }
+          // 2. Force the AI to speak immediately (bypassing VAD silence wait)
+          // We assume session.client exposes the raw OpenAI client
+          try {
+            if (session.client && typeof session.client.send === 'function') {
+                console.log('[Session] Forcing response creation...');
+                session.client.send('response.create', { response: {} });
+            }
+          } catch (e) {
+            console.error('[Session] Could not force response:', e);
           }
       }, 1500) // 1.5s delay for Twilio to stabilize
 
