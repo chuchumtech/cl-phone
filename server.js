@@ -207,12 +207,20 @@ wss.on('connection', (ws, req) => {
         tools: [pickupTool],
       })
 
-      const session = new RealtimeSession(agent, {
+const session = new RealtimeSession(agent, {
         transport: twilioTransport,
-        model: 'gpt-4o-realtime-preview-2024-10-01', // Ensure correct model ID
+        model: 'gpt-4o-realtime-preview-2024-10-01',
+        turnDetection: {
+             type: 'server_vad', // 👈 Explicitly force standard VAD to fix the crash
+             threshold: 0.6,     // 👈 Higher threshold (0.0 to 1.0) ignores background noise
+             prefix_padding_ms: 300,
+             silence_duration_ms: 600
+        },
         config: {
           audio: {
-            output: { voice: 'verse' }, // 'verse' is expressive/youthful
+            output: {
+              voice: 'verse',
+            },
           },
         },
       })
