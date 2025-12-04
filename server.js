@@ -127,7 +127,7 @@ async function getItemRecords({ itemQuery }) {
   const { data, error } = await supabase
     .from('cl_items_kashrus') // 👈 change if your table name is different
     .select('*')
-    .or(`item.ilike.%${search}%,description.ilike.%${search}%`)
+    .or(`item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`)
     .limit(5)
 
   if (error) {
