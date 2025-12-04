@@ -234,13 +234,21 @@ wss.on('connection', (ws, req) => {
     }
   })
 
-  const transferToRouter = tool({
+const transferToRouter = tool({
     name: 'transfer_to_main_menu',
-    description: 'Go back to the main menu/receptionist.',
+    description: 'Go back to the main menu.',
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Router')
       await session.updateAgent(routerAgent)
+      
+      // CRITICAL UPDATE: 
+      // We simulate the user saying this so the Router triggers the "Returning User" logic
+      // instead of the initial greeting.
+      if (session && session.sendMessage) {
+          session.sendMessage("I need help with something else.")
+      }
+      
       return "One moment, let me get the receptionist."
     }
   })
