@@ -210,12 +210,6 @@ wss.on('connection', (ws, req) => {
 const session = new RealtimeSession(agent, {
         transport: twilioTransport,
         model: 'gpt-realtime',
-        turnDetection: {
-             type: 'server_vad', // 👈 Explicitly force standard VAD to fix the crash
-             threshold: 0.6,     // 👈 Higher threshold (0.0 to 1.0) ignores background noise
-             prefix_padding_ms: 300,
-             silence_duration_ms: 600
-        },
         config: {
           audio: {
             output: {
@@ -231,10 +225,8 @@ const session = new RealtimeSession(agent, {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
 
-      setTimeout(() => {
-        console.log('[Session] Sending greeting trigger...')
+ 
         session.sendMessage('GREETING_TRIGGER')
-      }, 1000)
 
     } catch (err) {
       console.error('[Session] Startup Error:', err)
