@@ -233,51 +233,50 @@ wss.on('connection', (ws, req) => {
 
   console.log('[WS] New Twilio media stream connected')
 
+  // --- Create the Realtime agent for THIS call -----------------------------
+ const system_instructions = await getSystemPrompt()
+  const agent = new RealtimeAgent({
+    name: 'Chasdei Lev Pickup Assistant',
+    instructions: system_instructions,
+    tools: [pickupTool],
+  })
+
+  // --- Bridge Twilio <-> OpenAI via the Twilio transport -------------------
+
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws, // this is the Twilio Media Streams WS connection
   })
 
+  const session = new RealtimeSession(agent, {
+    transport: twilioTransport,
+    model: 'gpt-realtime', // OpenAI Realtime voice model
+    config: {
+      audio: {
+        output: {
+          voice: 'verse', // you can change the voice later if you want
+        },
+      },
+    },
+  })
+
+  // Optional: log basic events from the session
+  session.on('response.completed', () => {
+    console.log('[Session] Response completed')
+  })
+
+  session.on('error', (err) => {
+    console.error('[Session] Error:', err)
+  })
+
   ;(async () => {
     try {
-      // 👇 Load system prompt from Supabase (or fall back to default)
-      const instructions = await getSystemPrompt()
-      console.log('[Prompt] Using instructions length:', instructions.length)
-
-      // --- Create the Realtime agent for THIS call -------------------------
-      const agent = new RealtimeAgent({
-        name: 'Chasdei Lev Pickup Assistant',
-        instructions: instructions,
-        tools: [pickupTool],
-      })
-
-      const session = new RealtimeSession(agent, {
-        transport: twilioTransport,
-        model: 'gpt-realtime',
-        config: {
-          audio: {
-            output: {
-              voice: 'verse',
-            },
-          },
-        },
-      })
-
-      // Optional: log basic events from the session
-      session.on('response.completed', () => {
-        console.log('[Session] Response completed')
-      })
-
-      session.on('error', (err) => {
-        console.error('[Session] Error:', err)
-      })
-
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
-
-      // 👇 Force Chaim to greet immediately on call connect
-      session.sendMessage('GREETING_TRIGGER')
+       session.sendMessage(
+      "GREETING_TRIGGER"
+    )
     } catch (err) {
-      console.error('[Session] Failed to start Realtime session:', err)
+      console.error('[Session] Failed to connect to OpenAI:', err)
       ws.close()
     }
   })()
