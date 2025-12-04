@@ -231,8 +231,10 @@ const session = new RealtimeSession(agent, {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
 
-      // Force Greeting
-      session.sendMessage('GREETING_TRIGGER')
+      setTimeout(() => {
+        console.log('[Session] Sending greeting trigger...')
+        session.sendMessage('GREETING_TRIGGER')
+      }, 1000)
 
     } catch (err) {
       console.error('[Session] Startup Error:', err)
