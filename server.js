@@ -6,6 +6,35 @@ import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
 import { speakAnswer } from './answers.js'   // 👈 NEW
+import { supabase } from './supabaseClient.js' // same one answers.js uses
+
+const DEFAULT_SYSTEM_PROMPT = `
+You are the automated Chasdei Lev pickup information assistant.
+If your system prompt cannot be loaded from the database, you must say:
+"There is a temporary issue with the Chasdei Lev phone system. Please try your call again later."
+Then end the call.
+`
+
+async function getSystemPrompt() {
+  try {
+    const { data, error } = await supabase
+      .from('agent_system_prompts')
+      .select('content')
+      .eq('key', 'cl_pickup_system_prompt')
+      .eq('is_active', true)
+      .single()
+
+    if (error || !data) {
+      console.error('[Prompt] Error loading system prompt:', error)
+      return DEFAULT_SYSTEM_PROMPT
+    }
+
+    return data.content
+  } catch (err) {
+    console.error('[Prompt] Unexpected error loading system prompt:', err)
+    return DEFAULT_SYSTEM_PROMPT
+  }
+}
 
 dotenv.config()
 
@@ -15,57 +44,7 @@ if (!OPENAI_API_KEY) {
   process.exit(1)
 }
 
-const SYSTEM_PROMPT = `
-You are the automated Chasdei Lev pickup information assistant.
 
-Your job:
-- Understand caller speech about Chasdei Lev pickup times and locations.
-- Ask politely for their city or region if they don't provide it.
-- When a caller asks about pickup times or locations, call the tool get_pickup_times.
-- Use the tool results to give a clear answer: date, time window, and address.
-
-GREETING BEHAVIOR (VERY IMPORTANT):
-- In your FIRST response of each call, you MUST start by saying this exact greeting, before anything else:
-  "Hi, my name is Chaim. I am the Chasdei Lev Virtual Assistant."
-  (Pause briefly, then say with a cheerful, playful tone:)
-  "Think of me as the teacher's pet. What can I help you with? You can say things like, 'When is my pickup?'"
-- After you finish this greeting, in the same response you may continue with the answer to the caller's first question.
-
-FIRST RESPONSE BEHAVIOR OVERRIDE:
-- When you receive the message "GREETING_TRIGGER", you MUST immediately speak the greeting exactly as written, even though the caller has not yet spoken.
-- This greeting must always be your first spoken output of the call.
-- Do not wait for caller input before giving the greeting.
-
-INTERRUPTION RULE:
-- If the caller speaks during the greeting, you must continue and finish the greeting before responding to the caller's question.
-
-FACTUAL ANSWERS:
-- For pickup questions, you MUST call the get_pickup_times tool.
-- The tool returns an object that includes a field named "spoken_text".
-- When describing pickup details (date, time, address), you must read the "spoken_text" value exactly without changing the factual content.
-- You MAY wrap "spoken_text" with short non-factual phrases like:
-  - "Here is the information you requested."
-  - "Okay, here are the details."
-- You MAY NOT invent any factual details that are not in the tool result.
-- You MAY NOT add suggestions like "contact the organizers", "check WhatsApp", or anything similar.
-
-FOLLOW-UP AND REPEAT:
-- After giving a pickup answer, you should end your response with a follow-up question:
-  "Would you like me to repeat that, or is there another location I can help you with?"
-- If the caller indicates they did not hear or understand (for example: "repeat", "again", "I didn't catch that"), you must repeat the same pickup information clearly and slowly.
-- If the caller says they are done (for example: "no", "that's it", "thank you"), you should say:
-  "Okay, thanks for calling Chasdei Lev. Goodbye."
-  Do NOT introduce new topics after that.
-
-SCOPE LIMITS:
-- If the caller asks about something outside pickup times and locations, say exactly:
-  "I only have information about pickup times and locations."
-- Do not answer general halachic, financial, or unrelated questions.
-
-STYLE:
-- Speak slowly and clearly, in a friendly, youthful, cheerful tone.
-- Be concise. Keep answers short and focused on pickup details.
-`
 
 // --- Location helpers -------------------------------------------------------
 
@@ -254,50 +233,50 @@ wss.on('connection', (ws, req) => {
 
   console.log('[WS] New Twilio media stream connected')
 
-  // --- Create the Realtime agent for THIS call -----------------------------
-
-  const agent = new RealtimeAgent({
-    name: 'Chasdei Lev Pickup Assistant',
-    instructions: SYSTEM_PROMPT,
-    tools: [pickupTool],
-  })
-
-  // --- Bridge Twilio <-> OpenAI via the Twilio transport -------------------
-
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws, // this is the Twilio Media Streams WS connection
   })
 
-  const session = new RealtimeSession(agent, {
-    transport: twilioTransport,
-    model: 'gpt-realtime', // OpenAI Realtime voice model
-    config: {
-      audio: {
-        output: {
-          voice: 'verse', // you can change the voice later if you want
-        },
-      },
-    },
-  })
-
-  // Optional: log basic events from the session
-  session.on('response.completed', () => {
-    console.log('[Session] Response completed')
-  })
-
-  session.on('error', (err) => {
-    console.error('[Session] Error:', err)
-  })
-
   ;(async () => {
     try {
+      // 👇 Load system prompt from Supabase (or fall back to default)
+      const instructions = await getSystemPrompt()
+
+      // --- Create the Realtime agent for THIS call -------------------------
+      const agent = new RealtimeAgent({
+        name: 'Chasdei Lev Pickup Assistant',
+        instructions,
+        tools: [pickupTool],
+      })
+
+      const session = new RealtimeSession(agent, {
+        transport: twilioTransport,
+        model: 'gpt-realtime',
+        config: {
+          audio: {
+            output: {
+              voice: 'verse',
+            },
+          },
+        },
+      })
+
+      // Optional: log basic events from the session
+      session.on('response.completed', () => {
+        console.log('[Session] Response completed')
+      })
+
+      session.on('error', (err) => {
+        console.error('[Session] Error:', err)
+      })
+
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI Realtime API')
-       session.sendMessage(
-      "GREETING_TRIGGER"
-    )
+
+      // 👇 Force Chaim to greet immediately on call connect
+      session.sendMessage('GREETING_TRIGGER')
     } catch (err) {
-      console.error('[Session] Failed to connect to OpenAI:', err)
+      console.error('[Session] Failed to start Realtime session:', err)
       ws.close()
     }
   })()
