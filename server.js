@@ -246,7 +246,7 @@ wss.on('connection', (ws, req) => {
       // --- Create the Realtime agent for THIS call -------------------------
       const agent = new RealtimeAgent({
         name: 'Chasdei Lev Pickup Assistant',
-        instructions,
+        instructions: instructions,
         tools: [pickupTool],
       })
 
