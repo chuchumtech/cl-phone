@@ -209,7 +209,7 @@ wss.on('connection', (ws, req) => {
 
 const session = new RealtimeSession(agent, {
         transport: twilioTransport,
-        model: 'gpt-4o-realtime-preview-2024-10-01',
+        model: 'gpt-realtime',
         turnDetection: {
              type: 'server_vad', // 👈 Explicitly force standard VAD to fix the crash
              threshold: 0.6,     // 👈 Higher threshold (0.0 to 1.0) ignores background noise
