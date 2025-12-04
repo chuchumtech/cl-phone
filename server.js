@@ -214,6 +214,24 @@ const pickupTool = tool({
 
       const first = results[0]
 
+      // Prefer region-style label (Brooklyn / Monsey / Lakewood)
+      const cityLabel =
+        first.region || first.city || city || region || 'your location'
+
+      // 🔴 NEW: Handle TBD *before* formatting date/time
+      if (first.is_tbd === true) {
+        const spoken_text = await speakAnswer('pickup_tbd', {
+          city: cityLabel,
+        })
+
+        return {
+          spoken_text,
+          has_results: false,  // no concrete date/time yet
+          results,
+        }
+      }
+
+      // --- Format date + time nicely for speech (only when NOT TBD) --------
       const rawDate = first.event_date || first.date || ''
       const dateSpoken = formatSpokenDate(rawDate)
 
@@ -221,9 +239,7 @@ const pickupTool = tool({
       const end = formatTime24To12(first.end_time)
 
       const timeWindowSpoken =
-        first.is_tbd
-          ? '' // if TBD, we’ll just omit the time window for now
-          : start && end
+        start && end
           ? `${start} to ${end}`
           : ''
 
@@ -239,9 +255,6 @@ const pickupTool = tool({
         ]
           .filter(Boolean)
           .join(', ')
-
-      const cityLabel =
-        first.region || first.city || city || region || 'your location'
 
       const spoken_text = await speakAnswer('pickup_success', {
         city: cityLabel,
