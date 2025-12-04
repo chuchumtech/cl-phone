@@ -316,7 +316,7 @@ wss.on('connection', (ws, req) => {
 
   const session = new RealtimeSession(agent, {
     transport: twilioTransport,
-    model: 'gpt-4o-realtime-preview-2024-10-01', 
+    model: 'gpt-realtime', 
         config: {
           audio: {
         output: {
