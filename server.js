@@ -13,7 +13,7 @@ dotenv.config()
 const { OPENAI_API_KEY, PORT = 8080 } = process.env
 
 // ---------------------------------------------------------------------------
-// 1. PROMPT & AGENT MANAGEMENT
+// 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
 
 const PROMPTS = {
@@ -23,58 +23,42 @@ const PROMPTS = {
 }
 
 async function loadPromptsFromDB() {
-  const { data } = await supabase
-    .from('agent_system_prompts')
-    .select('key, content')
-    .in('key', ['agent_router', 'agent_pickup', 'agent_items'])
-    .eq('is_active', true)
+  try {
+    const { data } = await supabase
+      .from('agent_system_prompts')
+      .select('key, content')
+      .in('key', ['agent_router', 'agent_pickup', 'agent_items'])
+      .eq('is_active', true)
 
-  data?.forEach(row => {
-    if (row.key === 'agent_router') PROMPTS.router = row.content
-    if (row.key === 'agent_pickup') PROMPTS.pickup = row.content
-    if (row.key === 'agent_items') PROMPTS.items = row.content
+    data?.forEach(row => {
+      if (row.key === 'agent_router') PROMPTS.router = row.content
+      if (row.key === 'agent_pickup') PROMPTS.pickup = row.content
+      if (row.key === 'agent_items') PROMPTS.items = row.content
+    })
+    console.log('[System] Prompts Loaded')
+  } catch (e) {
+    console.error('[System] DB Error', e)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. HELPER: Tool Formatter
+// ---------------------------------------------------------------------------
+// The OpenAI API expects raw JSON for tools, but the SDK gives us objects.
+// This helper ensures we send the correct format during updates.
+function formatToolsForUpdate(toolList) {
+  return toolList.map(t => {
+    if (t.type === 'function') return t
+    if (t.definition) return { type: 'function', ...t.definition }
+    return t
   })
 }
 
 // ---------------------------------------------------------------------------
-// 2. TOOL DEFINITIONS (Reusable)
+// 3. SERVER
 // ---------------------------------------------------------------------------
 
-// We define tools *outside* the connection to keep code clean. 
-// They don't need 'session' access if they just return data strings.
-
-const pickupTool = tool({
-  name: 'get_pickup_times',
-  description: 'Get pickup dates/times/addresses.',
-  parameters: z.object({
-    region: z.string().nullable().describe('Region name e.g. Brooklyn'),
-    city: z.string().nullable().describe('City name e.g. Lakewood'),
-  }),
-  execute: async ({ region, city }) => {
-    // ... (Your existing pickup logic) ...
-    // For brevity, assuming this returns the spoken text string
-    return { spoken_text: "Pickup is Tuesday at 5pm." } 
-  },
-})
-
-const itemInfoTool = tool({
-  name: 'get_item_info',
-  description: 'Get kashrus or description for an item.',
-  parameters: z.object({
-    item_query: z.string(),
-    focus: z.enum(['kashrus', 'description', 'both']),
-  }),
-  execute: async ({ item_query, focus }) => {
-    // ... (Your existing item logic) ...
-    return { spoken_text: "The cheese is Chalav Yisrael." }
-  },
-})
-
-// ---------------------------------------------------------------------------
-// 3. SERVER LOGIC
-// ---------------------------------------------------------------------------
-
-await loadPromptsFromDB() // Load once at startup
+await loadPromptsFromDB()
 
 const wss = new WebSocketServer({ port: PORT })
 
@@ -84,80 +68,133 @@ wss.on('connection', (ws, req) => {
     return
   }
   
-  // --- DEFINE AGENTS ---
-  // We create 3 distinct "Brains". 
-  // Each has its own Instructions and its own Tools.
+  console.log('[WS] New Connection')
 
-  const pickupAgent = new RealtimeAgent({
-    name: 'Pickup Specialist',
-    instructions: PROMPTS.pickup,
-    tools: [pickupTool], // This agent ONLY knows pickup tools
+  let session = null // Capture session in scope
+  let routerAgent = null // Capture router in scope so "Back" tool can see it
+
+  // --- A. Define Business Tools ---
+
+  const pickupTool = tool({
+    name: 'get_pickup_times',
+    description: 'Get pickup dates/times/addresses.',
+    parameters: z.object({
+      region: z.string().nullable().describe('Region name e.g. Brooklyn'),
+      city: z.string().nullable().describe('City name e.g. Lakewood'),
+    }),
+    execute: async ({ region, city }) => {
+      // ... (Add your API logic here) ...
+      const spoken_text = await speakAnswer('pickup_success', { 
+          city: city || region || 'your location', 
+          date_spoken: "Tuesday", 
+          time_window: "5pm to 9pm", 
+          address: "123 Main St" 
+      }) 
+      return { spoken_text }
+    },
   })
 
-  const itemsAgent = new RealtimeAgent({
-    name: 'Item Specialist',
-    instructions: PROMPTS.items,
-    tools: [itemInfoTool], // This agent ONLY knows item tools
+  const itemInfoTool = tool({
+    name: 'get_item_info',
+    description: 'Get kashrus or description for an item.',
+    parameters: z.object({
+      item_query: z.string(),
+      focus: z.enum(['kashrus', 'description', 'both']),
+    }),
+    execute: async ({ item_query }) => {
+       // ... (Add your API logic here) ...
+       const spoken_text = await speakAnswer('item_full', {
+           item: item_query,
+           hechsher: "CRC",
+           description: "Tasty cheese"
+       })
+       return { spoken_text }
+    },
   })
 
-  // We define the Router's tools *here* because they need access to `session`
-  // to perform the switch (the "Handoff").
+  // --- B. Define Navigation Tools (The "Handoffs") ---
 
-  const transferToPickup = tool({
-    name: 'transfer_to_pickup',
-    description: 'Transfer to the pickup scheduling department.',
-    parameters: z.object({}),
-    execute: async () => {
-      console.log('🔄 Switching to Pickup Agent')
-      // THE MAGIC FIX: Use updateAgent()
-      await session.updateAgent(pickupAgent)
-      // Return a message so the new agent knows what happened
-      return "Transfer complete. You are now speaking with the Pickup Specialist."
-    }
-  })
-
-  const transferToItems = tool({
-    name: 'transfer_to_items',
-    description: 'Transfer to the item information department.',
-    parameters: z.object({}),
-    execute: async () => {
-      console.log('🔄 Switching to Items Agent')
-      await session.updateAgent(itemsAgent)
-      return "Transfer complete. You are now speaking with the Item Specialist."
-    }
-  })
-
-  // Add a "Back to Menu" tool for the specialists to use
+  // 1. Tool to go BACK (Needs 'routerAgent' which is defined later)
   const transferToRouter = tool({
     name: 'transfer_to_main_menu',
     description: 'Go back to the main menu.',
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Router')
-      await session.updateAgent(routerAgent)
-      return "Transfer complete. You are back at the main menu."
+      if (session && routerAgent) {
+        // Manually update the session with the Router's configuration
+        await session.client.updateSession({
+          instructions: routerAgent.instructions,
+          tools: formatToolsForUpdate(routerAgent.tools)
+        })
+      }
+      return "Transferring you to the main menu."
     }
   })
 
-  // Add the "Back" tool to the specialists
-  // (We modify the instances we created above)
-  pickupAgent.addTool(transferToRouter)
-  itemsAgent.addTool(transferToRouter)
+  // 2. Define Specialists (Now we can pass transferToRouter in the constructor!)
+  const pickupAgent = new RealtimeAgent({
+    name: 'Pickup Specialist',
+    instructions: PROMPTS.pickup,
+    tools: [pickupTool, transferToRouter], // <--- No .addTool needed!
+  })
 
-  // Finally, define the Router Agent
-  const routerAgent = new RealtimeAgent({
+  const itemsAgent = new RealtimeAgent({
+    name: 'Item Specialist',
+    instructions: PROMPTS.items,
+    tools: [itemInfoTool, transferToRouter], // <--- No .addTool needed!
+  })
+
+  // 3. Tools to go FORWARD (Use the specialists we just made)
+  const transferToPickup = tool({
+    name: 'transfer_to_pickup',
+    description: 'Transfer to pickup department.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('🔄 Switching to Pickup')
+      if (session) {
+        await session.client.updateSession({
+            instructions: pickupAgent.instructions,
+            tools: formatToolsForUpdate(pickupAgent.tools)
+        })
+      }
+      return "Transferring you to the pickup specialist."
+    }
+  })
+
+  const transferToItems = tool({
+    name: 'transfer_to_items',
+    description: 'Transfer to item department.',
+    parameters: z.object({}),
+    execute: async () => {
+      console.log('🔄 Switching to Items')
+      if (session) {
+        await session.client.updateSession({
+            instructions: itemsAgent.instructions,
+            tools: formatToolsForUpdate(itemsAgent.tools)
+        })
+      }
+      return "Transferring you to the item specialist."
+    }
+  })
+
+  // --- C. Finally, Define the Router Agent ---
+  // Now we assign the variable we declared at the top
+  routerAgent = new RealtimeAgent({
     name: 'Router',
     instructions: PROMPTS.router,
     tools: [transferToPickup, transferToItems],
   })
 
-  // --- START SESSION ---
+  // --- D. Start Session ---
 
-  const session = new RealtimeSession(routerAgent, {
+  session = new RealtimeSession(routerAgent, {
     transport: new TwilioRealtimeTransportLayer({ twilioWebSocket: ws }),
     model: 'gpt-realtime',
     config: {
-      audio: { output: { voice: 'verse' } }
+      audio: { output: { voice: 'verse' } },
+      // Important: Start ONLY with Router tools visible
+      tools: formatToolsForUpdate(routerAgent.tools) 
     }
   })
 
