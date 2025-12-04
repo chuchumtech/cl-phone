@@ -5,7 +5,7 @@ import { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
-import { speakAnswer } from './answers.js' // Ensure this file exists and works!
+import { speakAnswer } from './answers.js'
 import { supabase } from './supabaseClient.js'
 
 dotenv.config()
@@ -36,7 +36,6 @@ async function loadPromptsFromDB() {
 
     if (error) throw error
 
-    // Map DB rows to our object
     data.forEach(row => {
       if (row.key === 'agent_router') PROMPTS.router = row.content
       if (row.key === 'agent_pickup') PROMPTS.pickup = row.content
@@ -137,8 +136,9 @@ wss.on('connection', (ws, req) => {
     name: 'get_pickup_times',
     description: 'Get pickup dates/times/addresses.',
     parameters: z.object({
-      region: z.string().optional(),
-      city: z.string().optional(),
+      // FIXED: Used nullable() instead of optional() for Strict Mode
+      region: z.string().nullable().describe('The region name if mentioned, e.g. Brooklyn'),
+      city: z.string().nullable().describe('The city name if mentioned, e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
       try {
@@ -158,8 +158,6 @@ wss.on('connection', (ws, req) => {
         }
 
         // 3. Success
-        // NOTE: We assume speakAnswer handles the date/time formatting internally now, 
-        // or you can add the formatting helpers back here if needed.
         const spoken_text = await speakAnswer('pickup_success', { 
             city: cityLabel, 
             date_spoken: first.event_date || first.date, 
@@ -180,9 +178,10 @@ wss.on('connection', (ws, req) => {
     description: 'Get kashrus or description for an item.',
     parameters: z.object({
       item_query: z.string(),
-      focus: z.enum(['kashrus', 'description', 'both']).optional(), // made optional to match prompt flexibility
+      // FIXED: Removed optional(), forced the enum to be required. 
+      focus: z.enum(['kashrus', 'description', 'both']).describe('Whether the user wants kashrus info, description, or both.'), 
     }),
-    execute: async ({ item_query, focus = 'both' }) => {
+    execute: async ({ item_query, focus }) => {
       try {
         const items = await getItemRecords({ itemQuery: item_query })
         
@@ -200,6 +199,7 @@ wss.on('connection', (ws, req) => {
         let key = 'item_full'
         if (focus === 'kashrus') key = 'item_kashrus_only'
         else if (focus === 'description') key = 'item_description_only'
+        // Default to 'item_full' if 'both' is passed
 
         const spoken_text = await speakAnswer(key, {
             item: item.item,
