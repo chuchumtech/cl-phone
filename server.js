@@ -23,9 +23,9 @@ If your system prompt cannot be loaded from the database, you must say:
 Then end the call.
 `
 
-// --- 1. Database & Template Helpers (Self-Contained Scalability) ------------
+// --- 1. Database & Template Helpers -----------------------------------------
 
-async function loadSystemPromptFromDB() {
+async function getSystemPrompt() {
   try {
     const { data, error } = await supabase
       .from('agent_system_prompts')
@@ -35,28 +35,15 @@ async function loadSystemPromptFromDB() {
       .single()
 
     if (error || !data) {
-      console.error('[Prompt] DB error or missing row, using DEFAULT_SYSTEM_PROMPT:', error)
-      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
-      return
+      console.error('[Prompt] Error loading system prompt:', error)
+      return DEFAULT_SYSTEM_PROMPT
     }
-
-    if (!data.content || typeof data.content !== 'string' || !data.content.trim()) {
-      console.error('[Prompt] Empty/invalid content in DB, using DEFAULT_SYSTEM_PROMPT')
-      SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
-      return
-    }
-
-    SYSTEM_PROMPT = data.content
-    console.log('[Prompt] Loaded system prompt from DB, length:', SYSTEM_PROMPT.length)
+    return data.content
   } catch (err) {
-    console.error('[Prompt] Unexpected error loading system prompt, using default:', err)
-    SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+    console.error('[Prompt] Unexpected error loading system prompt:', err)
+    return DEFAULT_SYSTEM_PROMPT
   }
 }
-
-// Fire once on startup (no await needed)
-loadSystemPromptFromDB()
-
 
 async function getTemplate(key) {
   const { data, error } = await supabase
@@ -128,14 +115,12 @@ const pickupTool = tool({
       
       const searchKey = normalizeLocation(city)
       
-      // A. Query DB
       const { data: locations, error } = await supabase
         .from('cl_sukkos_distribution_locations_rows')
         .select('*')
         .or(`region.ilike.%${searchKey}%,city.ilike.%${searchKey}%`)
         .limit(1)
 
-      // B. Not Found
       if (error || !locations || locations.length === 0) {
         const template = await getTemplate('pickup_not_found')
         return { spoken_text: template }
@@ -144,14 +129,12 @@ const pickupTool = tool({
       const loc = locations[0]
       const cityLabel = loc.region || loc.city
 
-      // C. TBD
       if (loc.is_tbd) {
         const template = await getTemplate('pickup_tbd')
         const spoken = template.replace('{{city}}', cityLabel)
         return { spoken_text: spoken }
       }
 
-      // D. Success
       const template = await getTemplate('pickup_success')
       const dateSpoken = formatSpokenDate(loc.event_date)
       const timeSpoken = formatSpokenTime(loc.start_time, loc.end_time)
@@ -195,24 +178,26 @@ wss.on('connection', (ws, req) => {
     ws.close()
     return
   }
- console.log('[WS] New Twilio media stream connected')
 
-  // --- Create the Realtime agent for THIS call (same as working version) ---
-  const agent = new RealtimeAgent({
-    name: 'Chasdei Lev Pickup Assistant',
-    instructions: SYSTEM_PROMPT,   // 👈 now DB-updated global
-    tools: [pickupTool],
-  })
   const twilioTransport = new TwilioRealtimeTransportLayer({
     twilioWebSocket: ws,
   })
-      // --- CRITICAL CONFIGURATION -------------------------------------------
+
+  ;(async () => {
+    try {
+      const instructions = await getSystemPrompt()
+      console.log(`[System] Prompt loaded (${instructions.length} chars)`)
+
+      const agent = new RealtimeAgent({
+        name: 'Chasdei Lev Pickup Assistant',
+        instructions,
+        tools: [pickupTool],
+      })
+
       const session = new RealtimeSession(agent, {
         transport: twilioTransport,
-        // 1. MUST use Preview Model for VAD
         model: 'gpt-4o-realtime-preview-2024-10-01', 
         config: {
-          // 2. MUST use camelCase 'turnDetection'
           turnDetection: {
             type: 'server_vad',
             threshold: 0.6, // Higher = Ignores background noise
@@ -233,11 +218,26 @@ wss.on('connection', (ws, req) => {
       await session.connect({ apiKey: OPENAI_API_KEY })
       console.log('[Session] Connected to OpenAI')
 
-      // 3. DELAY GREETING (Prevents Silence)
+      // --- CRITICAL FIX: FORCE THE GREETING ---
       setTimeout(() => {
-          console.log('[Session] Sending greeting...')
-          session.sendMessage('GREETING_TRIGGER')
-      }, 1000)
+          console.log('[Session] Triggering greeting...')
+          
+          // 1. Send the text trigger
+          session.sendUserMessageContent([{ type: 'input_text', text: 'GREETING_TRIGGER' }])
+          
+          // 2. FORCE response generation (Required because VAD is waiting for silence)
+          if (session.client && typeof session.client.createResponse === 'function') {
+             session.client.createResponse();
+          } else {
+             // Fallback for different SDK versions: try to force a response via raw event
+             // This uses the underlying client to send "response.create"
+             try {
+                session.client.realtime.send('response.create', { response: {} })
+             } catch(e) {
+                console.log("Could not force response via raw client, relying on VAD timeout")
+             }
+          }
+      }, 1500) // 1.5s delay for Twilio to stabilize
 
     } catch (err) {
       console.error('[Session] Startup Error:', err)
