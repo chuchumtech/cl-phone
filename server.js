@@ -41,15 +41,11 @@ async function loadPromptsFromDB() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. HELPER: Tool Formatter (CRITICAL)
+// 2. HELPER: Tool Formatter
 // ---------------------------------------------------------------------------
-// We must strip the 'execute' function when sending updates to OpenAI, 
-// otherwise the API will reject the JSON.
 function formatForOpenAI(toolList) {
   return toolList.map(t => {
-    // If it has a 'definition' property (standard SDK tool), return that.
     if (t.definition) return { type: 'function', ...t.definition }
-    // Fallback if it's already raw JSON
     return t
   })
 }
@@ -82,7 +78,7 @@ wss.on('connection', (ws, req) => {
       city: z.string().nullable().describe('City name e.g. Lakewood'),
     }),
     execute: async ({ region, city }) => {
-      // Logic from your original file
+      // ⬇️ Replace this with your actual API Logic from previous versions
       const spoken_text = await speakAnswer('pickup_success', { 
           city: city || region || 'your location', 
           date_spoken: "Tuesday", 
@@ -101,6 +97,7 @@ wss.on('connection', (ws, req) => {
       focus: z.enum(['kashrus', 'description', 'both']),
     }),
     execute: async ({ item_query }) => {
+       // ⬇️ Replace this with your actual API Logic from previous versions
        const spoken_text = await speakAnswer('item_full', {
            item: item_query,
            hechsher: "CRC",
@@ -111,14 +108,10 @@ wss.on('connection', (ws, req) => {
   })
 
   // --- B. Define NAVIGATION Tools ---
-
-  // NOTE: We define the "Target States" as simple arrays of tools.
-  // We do NOT create new Agent classes here, we just hold the configs.
   
-  const pickupToolsList = [pickupTool] // Will add 'back' button later
+  const pickupToolsList = [pickupTool] 
   const itemsToolsList = [itemInfoTool]
-  const routerToolsList = [] // Will add 'transfer' buttons later
-
+  
   // 1. Transfer TO Pickup
   const transferToPickup = tool({
     name: 'transfer_to_pickup',
@@ -126,8 +119,8 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Pickup')
-      if (session) {
-        // We add the "Back" tool to the list dynamically here
+      if (session && session.client) {
+        // Add "Back" button dynamically
         const toolsForPickup = [...pickupToolsList, transferToRouter]
         
         await session.client.updateSession({
@@ -146,7 +139,7 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Items')
-      if (session) {
+      if (session && session.client) {
         const toolsForItems = [...itemsToolsList, transferToRouter]
         
         await session.client.updateSession({
@@ -165,7 +158,7 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       console.log('🔄 Switching to Router')
-      if (session) {
+      if (session && session.client) {
         const toolsForRouter = [transferToPickup, transferToItems]
         
         await session.client.updateSession({
@@ -177,12 +170,7 @@ wss.on('connection', (ws, req) => {
     }
   })
 
-  // --- C. The "Super Agent" Logic ---
-  
-  // CRITICAL STEP:
-  // The 'RealtimeAgent' we initialize the session with MUST have EVERY tool.
-  // This ensures that if OpenAI sends a function call, the local code can run it.
-  // We control "Access" via the updateSession call, not by removing tools locally.
+  // --- C. Master Logic ---
 
   const allTools = [
     pickupTool,
@@ -194,8 +182,8 @@ wss.on('connection', (ws, req) => {
 
   const masterAgent = new RealtimeAgent({
     name: 'Chasdei Lev Logic Core',
-    instructions: PROMPTS.router, // Default start prompt
-    tools: allTools,              // REGISTER EVERYTHING LOCALLY
+    instructions: PROMPTS.router, 
+    tools: allTools, // Register ALL tools locally
   })
 
   // --- D. Start Session ---
@@ -205,7 +193,7 @@ wss.on('connection', (ws, req) => {
     model: 'gpt-realtime',
     config: {
       audio: { output: { voice: 'verse' } },
-      // INITIAL VISIBILITY: Only show Router tools to OpenAI at start
+      // Start with ONLY Router tools visible
       tools: formatForOpenAI([transferToPickup, transferToItems]) 
     }
   })
@@ -213,7 +201,8 @@ wss.on('connection', (ws, req) => {
   session.connect({ apiKey: OPENAI_API_KEY })
     .then(() => {
       console.log('✅ Connected to OpenAI')
-      session.sendUserMessageContent([{ type: 'input_text', text: 'GREETING_TRIGGER' }])
+      // FIX: Use session.client to send the user message
+      session.client.sendUserMessageContent([{ type: 'input_text', text: 'GREETING_TRIGGER' }])
     })
     .catch(err => {
       console.error(err)
