@@ -1,19 +1,29 @@
-import dotenv from 'dotenv'
 import http from 'http'
 import url from 'url'
 import { WebSocketServer } from 'ws'
+import dotenv from 'dotenv'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
 import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions'
-import { speakAnswer } from './answers.js'   // 👈 NEW
-import { supabase } from './supabaseClient.js' // same one answers.js uses
+import { supabase } from './supabaseClient.js' 
+
+dotenv.config()
+
+const { OPENAI_API_KEY } = process.env
+if (!OPENAI_API_KEY) {
+  console.error('Missing OPENAI_API_KEY in environment')
+  process.exit(1)
+}
 
 const DEFAULT_SYSTEM_PROMPT = `
 You are the automated Chasdei Lev pickup information assistant.
+Your name is Chaim.
 If your system prompt cannot be loaded from the database, you must say:
 "There is a temporary issue with the Chasdei Lev phone system. Please try your call again later."
 Then end the call.
 `
+
+// --- 1. Database & Template Helpers -----------------------------------------
 
 async function getSystemPrompt() {
   try {
@@ -28,7 +38,6 @@ async function getSystemPrompt() {
       console.error('[Prompt] Error loading system prompt:', error)
       return DEFAULT_SYSTEM_PROMPT
     }
-
     return data.content
   } catch (err) {
     console.error('[Prompt] Unexpected error loading system prompt:', err)
@@ -36,181 +45,134 @@ async function getSystemPrompt() {
   }
 }
 
-//dotenv.config()
-
-const { OPENAI_API_KEY } = process.env
-if (!OPENAI_API_KEY) {
-  console.error('Missing OPENAI_API_KEY in environment')
-  process.exit(1)
+async function getTemplate(key) {
+  const { data, error } = await supabase
+    .from('answer_templates')
+    .select('spoken_template')
+    .eq('key', key)
+    .single()
+  
+  if (error || !data) {
+    console.error(`[Templates] Error fetching '${key}':`, error)
+    return "Information is currently unavailable."
+  }
+  return data.spoken_template
 }
 
-
-
-// --- Location helpers -------------------------------------------------------
-
-const LOCATION_SYNONYMS = {
-  'boro park': { region: 'Brooklyn' },
-  boropark: { region: 'Brooklyn' },
-  flatbush: { region: 'Brooklyn' },
-  brooklyn: { region: 'Brooklyn' },
-  lakewood: { region: 'Lakewood' },
-  monsey: { region: 'Monsey' },
-  'five towns': { region: 'Five Towns' },
-  // add more as needed
-}
+// --- 2. Location & Formatting Logic -----------------------------------------
 
 function normalizeLocation(raw) {
-  if (!raw) return {}
-
-  const key = raw.toLowerCase().trim()
-  const mapped = LOCATION_SYNONYMS[key]
-
-  // If we have a mapped region (e.g. "flatbush" => "Brooklyn")
-  if (mapped?.region) {
-    return { region: mapped.region }
+  if (!raw) return ''
+  const lower = raw.toLowerCase().trim()
+  
+  const SYNONYMS = {
+    'boro park': 'Brooklyn',
+    'boropark': 'Brooklyn',
+    'flatbush': 'Brooklyn',
+    'five towns': 'Five Towns',
+    'far rockaway': 'Far Rockaway'
   }
+  return SYNONYMS[lower] || raw
+}
 
-  // If we had mapped city, treat that as region for the API
-  if (mapped?.city) {
-    return { region: mapped.city }
+function formatSpokenDate(dateStr) {
+  if (!dateStr) return ""
+  const date = new Date(dateStr + 'T12:00:00') // Avoid timezone shift
+  // e.g. "Sunday, September 7th"
+  const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
+  const monthName = date.toLocaleDateString('en-US', { month: 'long' })
+  const dayNum = date.getDate()
+  
+  let suffix = 'th'
+  if (dayNum % 10 === 1 && dayNum !== 11) suffix = 'st'
+  else if (dayNum % 10 === 2 && dayNum !== 12) suffix = 'nd'
+  else if (dayNum % 10 === 3 && dayNum !== 13) suffix = 'rd'
+
+  return `${dayName}, ${monthName} ${dayNum}${suffix}`
+}
+
+function formatSpokenTime(start, end) {
+  if (!start || !end) return ""
+  // Helper to convert 14:00:00 -> 2:00 PM
+  const to12h = (t) => {
+    const [h, m] = t.split(':')
+    const date = new Date()
+    date.setHours(Number(h), Number(m))
+    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
   }
-
-  // Fallback: whatever the caller said is the region
-  return { region: raw }
+  return `${to12h(start)} to ${to12h(end)}`
 }
 
-async function getPickupTimes({ region, city }) {
-  const norm = normalizeLocation(city || region)
-  const params = new URLSearchParams()
-
-  if (norm.region) params.set('region', norm.region)
-  if (norm.city) params.set('region', norm.region)
-
-  const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
-  console.log('[Pickup] Fetching:', apiUrl)
-
-  const res = await fetch(apiUrl)
-  if (!res.ok) {
-    console.error('[Pickup] Error from pickup-times API:', res.status, await res.text())
-    throw new Error('Pickup API error')
-  }
-
-  const json = await res.json()
-  console.log('[Pickup] Results:', JSON.stringify(json))
-
-  return json.results || []
-}
-
-// --- Tool: pickup-times using speakAnswer -----------------------------------
-
-function formatTime24To12(t) {
-  // t is like "12:30:00"
-  if (!t) return ''
-  const [h, m] = t.split(':')
-  const date = new Date()
-  date.setHours(Number(h), Number(m), 0, 0)
-  return date.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-  })
-}
-
-function formatSpokenDate(isoDate) {
-  // isoDate like "2025-09-14"
-  if (!isoDate) return ''
-  const d = new Date(isoDate + 'T12:00:00') // avoid timezone weirdness
-  return d.toLocaleDateString('en-US', {
-    weekday: 'long',   // Sunday
-    month: 'long',     // September
-    day: 'numeric',    // 14
-    // we skip the year so it doesn't sound clunky
-  })
-}
+// --- 3. The Tool (The Brain) -----------------------------------------------
 
 const pickupTool = tool({
   name: 'get_pickup_times',
   description: 'Get pickup dates/times/addresses for a Chasdei Lev distribution location',
   parameters: z.object({
-    region: z.string().optional().describe('Region name, e.g. "Brooklyn", "Five Towns"'),
-    city: z.string().optional().describe('City name, e.g. "Lakewood", "Monsey"'),
+    city: z.string().describe('City or Region name, e.g. "Lakewood", "Monsey", "Brooklyn"'),
   }),
-  execute: async ({ region, city }) => {
+  execute: async ({ city }) => {
     try {
-      console.log('[Tool:get_pickup_times] Called with:', { region, city })
-      const results = await getPickupTimes({ region, city })
+      console.log('[Tool] Searching for:', city)
+      
+      const searchKey = normalizeLocation(city)
+      
+      // A. Query Location Data
+      const { data: locations, error } = await supabase
+        .from('cl_sukkos_distribution_locations_rows')
+        .select('*')
+        .or(`region.ilike.%${searchKey}%,city.ilike.%${searchKey}%`)
+        .limit(1)
 
-      if (!results.length) {
-        const spoken_text = await speakAnswer('pickup_not_found', {
-          city,
-          region,
-        })
-
-        return {
-          spoken_text,
-          has_results: false,
-          results: [],
-        }
+      // B. Scenario: Not Found
+      if (error || !locations || locations.length === 0) {
+        const template = await getTemplate('pickup_not_found')
+        return { spoken_text: template }
       }
 
-      const first = results[0]
+      const loc = locations[0]
+      const cityLabel = loc.region || loc.city
 
-      // --- Format date + time nicely for speech ----------------------------
-
-      const rawDate = first.event_date || first.date || ''
-      const dateSpoken = formatSpokenDate(rawDate)
-
-      const start = formatTime24To12(first.start_time)
-      const end = formatTime24To12(first.end_time)
-
-      const timeWindowSpoken =
-        first.is_tbd
-          ? '' // if TBD, we’ll just omit the time window for now
-          : start && end
-          ? `${start} to ${end}`
-          : ''
-
-      const address =
-        first.full_address ||
-        [
-          first.location_name,
-          first.address_line1,
-          first.address_line2,
-          first.city,
-          first.state,
-          first.postal_code,
-        ]
-          .filter(Boolean)
-          .join(', ')
-
-      // Prefer region-style label (Brooklyn / Monsey / Lakewood)
-      const cityLabel =
-        first.region || first.city || city || region || 'your location'
-
-      const spoken_text = await speakAnswer('pickup_success', {
-        city: cityLabel,
-        date_spoken: dateSpoken,
-        time_window: timeWindowSpoken,
-        address,
-      })
-
-      return {
-        spoken_text,
-        has_results: true,
-        results,
+      // C. Scenario: TBD (Found but no times yet)
+      if (loc.is_tbd) {
+        const template = await getTemplate('pickup_tbd')
+        const spoken = template.replace('{{city}}', cityLabel)
+        return { spoken_text: spoken }
       }
+
+      // D. Scenario: Success (Active)
+      const template = await getTemplate('pickup_success')
+      
+      const dateSpoken = formatSpokenDate(loc.event_date)
+      const timeSpoken = formatSpokenTime(loc.start_time, loc.end_time)
+      
+      // Construct clean address
+      const addressParts = [
+        loc.location_name,
+        loc.address_line1,
+        loc.city,
+        loc.state
+      ].filter(p => p && p.trim() !== '')
+      
+      const fullAddress = addressParts.join(', ')
+
+      // Inject Variables
+      const spoken = template
+        .replace('{{city}}', cityLabel)
+        .replace('{{date_spoken}}', dateSpoken)
+        .replace('{{time_window}}', timeSpoken)
+        .replace('{{address}}', fullAddress)
+
+      return { spoken_text: spoken }
+
     } catch (err) {
-      console.error('[Tool:get_pickup_times] Error:', err)
-      const spoken_text = await speakAnswer('fallback_error')
-      return {
-        spoken_text,
-        has_results: false,
-        results: [],
-      }
+      console.error('[Tool] Error:', err)
+      return { spoken_text: "I'm having trouble accessing the schedule right now." }
     }
   },
 })
 
-// --- HTTP + WebSocket server -----------------------------------------------
+// --- 4. Server Setup --------------------------------------------------------
 
 const PORT = process.env.PORT || 8080
 
@@ -223,71 +185,70 @@ const wss = new WebSocketServer({ server })
 
 wss.on('connection', (ws, req) => {
   const { pathname } = url.parse(req.url || '')
-  console.log('[WS] New connection on path:', pathname)
+  console.log('[WS] New connection path:', pathname)
 
   if (pathname !== '/twilio-stream') {
-    console.log('[WS] Unknown path, closing')
     ws.close()
     return
   }
 
-  console.log('[WS] New Twilio media stream connected')
-
-  // --- Create the Realtime agent for THIS call -----------------------------
- const system_instructions = await getSystemPrompt()
-  const agent = new RealtimeAgent({
-    name: 'Chasdei Lev Pickup Assistant',
-    instructions: system_instructions,
-    tools: [pickupTool],
-  })
-
-  // --- Bridge Twilio <-> OpenAI via the Twilio transport -------------------
-
   const twilioTransport = new TwilioRealtimeTransportLayer({
-    twilioWebSocket: ws, // this is the Twilio Media Streams WS connection
+    twilioWebSocket: ws,
   })
 
-  const session = new RealtimeSession(agent, {
-    transport: twilioTransport,
-    model: 'gpt-realtime', // OpenAI Realtime voice model
-    config: {
-      audio: {
-        output: {
-          voice: 'verse', // you can change the voice later if you want
-        },
-      },
-    },
-  })
-
-  // Optional: log basic events from the session
-  session.on('response.completed', () => {
-    console.log('[Session] Response completed')
-  })
-
-  session.on('error', (err) => {
-    console.error('[Session] Error:', err)
-  })
-
+  // Start Async Logic Block
   ;(async () => {
     try {
+      // 1. Fetch Prompt (Moved inside async block!)
+      const instructions = await getSystemPrompt()
+      console.log('[System] Loaded instructions from DB')
+
+      // 2. Initialize Agent
+      const agent = new RealtimeAgent({
+        name: 'Chasdei Lev Pickup Assistant',
+        instructions,
+        tools: [pickupTool],
+      })
+
+      // 3. Initialize Session (With CRITICAL VAD SETTINGS)
+      const session = new RealtimeSession(agent, {
+        transport: twilioTransport,
+        // MUST use this model ID for VAD to work
+        model: 'gpt-4o-realtime-preview-2024-10-01', 
+        config: {
+          // Force Server VAD to prevent crash & handle noise
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.6, // Higher = ignores background noise
+            prefix_padding_ms: 300,
+            silence_duration_ms: 600
+          },
+          audio: {
+            output: {
+              voice: 'verse', 
+            },
+          },
+        },
+      })
+
+      session.on('response.completed', () => console.log('[Session] Response sent'))
+      session.on('error', (err) => console.error('[Session] Error:', err))
+
+      // 4. Connect
       await session.connect({ apiKey: OPENAI_API_KEY })
-      console.log('[Session] Connected to OpenAI Realtime API')
-       session.sendMessage(
-      "GREETING_TRIGGER"
-    )
+      console.log('[Session] Connected to OpenAI')
+
+      // 5. Send Greeting with Delay (Prevents Silence)
+      setTimeout(() => {
+          console.log('[Session] Sending greeting...')
+          session.sendMessage('GREETING_TRIGGER')
+      }, 1000)
+
     } catch (err) {
-      console.error('[Session] Failed to connect to OpenAI:', err)
+      console.error('[Session] Startup Error:', err)
       ws.close()
     }
   })()
-
-  ws.on('close', () => {
-    console.log('[WS] Twilio stream closed')
-  })
-
-  ws.on('error', (err) => {
-    console.error('[WS] WebSocket error', err)
-  })
 })
 
 server.listen(PORT, () => {
