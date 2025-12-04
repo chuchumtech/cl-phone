@@ -13,9 +13,10 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 
 // --- PROMPTS ---
 const PROMPTS = {
-  router: 'You are Leivi. Greet user. If they ask for pickup, say "Let me check the schedule..." and call transfer_to_pickup. If items, say "Let me check that item..." and call transfer_to_items.',
-  pickup: 'You are Leivi (Pickup Mode). Answer schedule questions. If user needs items/something else, call transfer_to_main_menu.',
-  items: 'You are Leivi (Item Mode). Answer item questions. If user needs pickup/something else, call transfer_to_main_menu.'
+  router: 'You are Leivi. Greet user. If pickup, say "Let me check the schedule..." -> transfer_to_pickup. If items, say "Let me check that item..." -> transfer_to_items. If sheitels/wigs, say "Let me check the wig calendar..." -> transfer_to_sheitel.',
+  pickup: 'You are Leivi (Pickup Mode). Answer schedule questions. If user needs items/wigs, call transfer_to_main_menu.',
+  items: 'You are Leivi (Item Mode). Answer item questions. If user needs pickup/wigs, call transfer_to_main_menu.',
+  sheitel: 'You are Leivi (Sheitel Mode). Answer wig sale questions. If user needs pickup/items, call transfer_to_main_menu.'
 }
 
 async function loadPromptsFromDB() {
@@ -23,42 +24,38 @@ async function loadPromptsFromDB() {
     const { data } = await supabase
       .from('agent_system_prompts')
       .select('key, content')
-      .in('key', ['agent_router', 'agent_pickup', 'agent_items'])
+      .in('key', ['agent_router', 'agent_pickup', 'agent_items', 'agent_sheitel'])
       .eq('is_active', true)
 
     data?.forEach(row => {
       if (row.key === 'agent_router') PROMPTS.router = row.content
       if (row.key === 'agent_pickup') PROMPTS.pickup = row.content
       if (row.key === 'agent_items') PROMPTS.items = row.content
+      if (row.key === 'agent_sheitel') PROMPTS.sheitel = row.content
     })
     console.log('[System] Prompts Loaded')
   } catch (e) { console.error(e) }
 }
 
-// --- API HELPERS (Keeping these short for brevity, assume full logic exists) ---
-// ... (Include your full getPickupTimes and getItemRecords functions here) ...
-// For the sake of this paste, I am assuming the API logic is exactly as your previous working version.
-async function getPickupTimes({ region, city }) {
-    // ... insert your fetch logic here ...
-    const params = new URLSearchParams();
-    if(region) params.append('region', region);
-    if(city) params.append('region', city); // API quirk
-    
-    // Quick Hack for testing if you don't paste the full function
-    // In production, paste the full function from previous steps
-    const res = await fetch(`https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`);
-    const json = await res.json();
-    return json.results || [];
-}
+// --- API HELPERS ---
 
-async function getItemRecords({ itemQuery }) {
-    // ... insert your DB logic here ...
-     const search = itemQuery.trim()
-     const { data } = await supabase.from('cl_items_kashrus')
-        .select('*')
-        .or(`item.ilike.%${search}%,description.ilike.%${search}%`)
-        .limit(5)
-     return data || []
+// ... (Keep getPickupTimes and getItemRecords here) ...
+
+async function getSheitelSales() {
+    // We only select date and region. We intentionally do NOT select the address.
+    const { data, error } = await supabase
+        .from('cl_sheitel_sales')
+        .select('event_date, region') 
+        .eq('is_active', true)
+        .gte('event_date', new Date().toISOString())
+        .order('event_date', { ascending: true })
+        .limit(1)
+
+    if (error) {
+        console.error('[Sheitel DB Error]', error)
+        return []
+    }
+    return data || []
 }
 
 // --- SERVER ---
@@ -74,95 +71,55 @@ wss.on('connection', (ws, req) => {
   let routerAgent = null;
   let pickupAgent = null;
   let itemsAgent = null;
+  let sheitelAgent = null; // New Agent Variable
 
-  // --- TOOLS ---
+  // --- BUSINESS TOOLS ---
 
-  const pickupTool = tool({
-    name: 'get_pickup_times',
-    description: 'Get pickup dates/times.',
-    parameters: z.object({
-      region: z.string().nullable(),
-      city: z.string().nullable(),
-    }),
-    execute: async ({ region, city }) => {
-      try {
-        const results = await getPickupTimes({ region, city })
-        if (!results.length) return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
-        
-        const first = results[0]
-        const cityLabel = first.region || first.city || city || 'your location'
-        
-        if (first.is_tbd) return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
+  // ... (Keep pickupTool and itemInfoTool here) ...
 
-        return { 
-            spoken_text: await speakAnswer('pickup_success', { 
-                city: cityLabel, 
-                date_spoken: first.event_date || first.date, 
-                time_window: `${first.start_time} to ${first.end_time}`, 
-                address: first.full_address 
-            })
-        }
-      } catch (e) { return { spoken_text: "I'm having trouble accessing the schedule." } }
-    },
-  })
-
-  const itemInfoTool = tool({
-    name: 'get_item_info',
-    description: 'Get item details.',
-    parameters: z.object({
-      item_query: z.string(),
-      focus: z.enum(['kashrus', 'description', 'both']),
-    }),
-    execute: async ({ item_query }) => {
-      const items = await getItemRecords({ itemQuery: item_query })
-      if (!items.length) return { spoken_text: await speakAnswer('item_not_found', {}) }
-      if (items.length > 1) return { spoken_text: await speakAnswer('item_ambiguous', { options: items.map(i=>i.item).join(', ') }) }
+  const sheitelTool = tool({
+    name: 'get_sheitel_sales',
+    description: 'Check for upcoming wig/sheitel sales.',
+    parameters: z.object({}), // No parameters needed, just checks the calendar
+    execute: async () => {
+      const sales = await getSheitelSales()
       
-      const item = items[0]
+      if (!sales || !sales.length) {
+          return { spoken_text: await speakAnswer('sheitel_none', {}) }
+      }
+
+      const sale = sales[0]
+      // Format date for speech
+      const dateSpoken = new Date(sale.event_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
+
       return { 
-          spoken_text: await speakAnswer('item_full', {
-              item: item.item, hechsher: item.hechsher || 'unknown', description: item.description || ''
+          spoken_text: await speakAnswer('sheitel_upcoming', { 
+              region: sale.region, 
+              date: dateSpoken 
           })
       }
     },
   })
 
-  // --- NAVIGATION (THE INVISIBLE HANDOFF) ---
+  // --- NAVIGATION TOOLS ---
 
-  const transferToPickup = tool({
-    name: 'transfer_to_pickup',
-    description: 'Use this to look up schedule info.',
-    parameters: z.object({
-      summary: z.string().describe('The user question')
-    }),
-    execute: async ({ summary }) => {
-      console.log(`[Switch] -> Pickup | Context: ${summary}`)
-      await session.updateAgent(pickupAgent)
-      
-      // Delay to let the "Sure, let me check..." audio finish naturally
-      if (summary) {
-        setTimeout(() => { if(session) session.sendMessage(summary) }, 2500)
-      }
-      // Return a silence filler so the user hears nothing weird
-      return "..." 
-    }
-  })
+  // ... (Keep transferToPickup and transferToItems here) ...
 
-  const transferToItems = tool({
-    name: 'transfer_to_items',
-    description: 'Use this to look up item info.',
-    parameters: z.object({
-      summary: z.string().describe('The user question')
-    }),
-    execute: async ({ summary }) => {
-      console.log(`[Switch] -> Items | Context: ${summary}`)
-      await session.updateAgent(itemsAgent)
-      
-      if (summary) {
-        setTimeout(() => { if(session) session.sendMessage(summary) }, 2500)
+  const transferToSheitel = tool({
+      name: 'transfer_to_sheitel',
+      description: 'Use this for questions about Wigs, Sheitels, or the Salon.',
+      parameters: z.object({
+        summary: z.string().describe('The user question')
+      }),
+      execute: async ({ summary }) => {
+        console.log(`[Switch] -> Sheitel | Context: ${summary}`)
+        await session.updateAgent(sheitelAgent)
+        
+        if (summary) {
+          setTimeout(() => { if(session) session.sendMessage(summary) }, 2500)
+        }
+        return "..."
       }
-      return "..."
-    }
   })
 
   const transferToRouter = tool({
@@ -173,7 +130,6 @@ wss.on('connection', (ws, req) => {
       console.log('[Switch] -> Router')
       await session.updateAgent(routerAgent)
       
-      // Trigger the "Returning User" logic
       setTimeout(() => { 
           if(session) session.sendMessage("I need help with something else.") 
       }, 2000)
@@ -196,10 +152,16 @@ wss.on('connection', (ws, req) => {
     tools: [itemInfoTool, transferToRouter],
   })
 
+  sheitelAgent = new RealtimeAgent({
+    name: 'Sheitel Brain',
+    instructions: PROMPTS.sheitel,
+    tools: [sheitelTool, transferToRouter],
+  })
+
   routerAgent = new RealtimeAgent({
     name: 'Router Brain',
     instructions: PROMPTS.router,
-    tools: [transferToPickup, transferToItems],
+    tools: [transferToPickup, transferToItems, transferToSheitel], // Added new transfer tool
   })
 
   // --- SESSION ---
@@ -210,7 +172,6 @@ wss.on('connection', (ws, req) => {
     config: { audio: { output: { voice: 'verse' } } }
   })
 
-  // Ignore race condition errors
   session.on('error', (err) => {
       const msg = err.message || JSON.stringify(err);
       if (msg.includes('active_response')) return;
