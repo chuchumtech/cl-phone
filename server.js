@@ -259,14 +259,13 @@ const pickupTool = tool({
 const itemInfoTool = tool({
   name: 'get_item_info',
   description:
-    'Get kashrus/hechsher details and a basic description for a specific Chasdei Lev item.',
+    'Get kashrus/hechsher details and a basic description for a specific Chahs-day Layv item.',
   parameters: z.object({
     item_query: z
       .string()
       .describe('What the caller says about the item, e.g. "cheese pack", "Haolam cheese", "salmon".'),
     focus: z
       .enum(['kashrus', 'description', 'both'])
-      .optional()
       .describe(
         'What the caller is primarily asking about: kashrus, description, or both. If unsure, use "both".'
       ),
@@ -288,7 +287,6 @@ const itemInfoTool = tool({
 
       // If multiple possible items, ask which one
       if (items.length > 1) {
-        // Build short list: "Cheese Pack A, Cheese Pack B, and Salmon"
         const names = items.map((it) => it.item).filter(Boolean)
         let optionsText = ''
 
