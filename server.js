@@ -16,9 +16,9 @@ const { OPENAI_API_KEY, PORT = 8080 } = process.env
 // 1. PROMPT LOADER
 // ---------------------------------------------------------------------------
 const PROMPTS = {
-  router: 'You are the router. Ask the user if they need pickup info or item info.',
-  pickup: 'You are the pickup specialist...',
-  items: 'You are the items specialist...'
+  router: 'You are the router. Greet the user. If they need pickup info, transfer to Pickup. If items, transfer to Items. Do not answer questions yourself.',
+  pickup: 'You are the Pickup Specialist. You answer questions about dates and times using the get_pickup_times tool. If asked about items, transfer to main menu.',
+  items: 'You are the Item Specialist. You answer questions about food and kashrus using the get_item_info tool. If asked about pickup, transfer to main menu.'
 }
 
 async function loadPromptsFromDB() {
@@ -41,18 +41,7 @@ async function loadPromptsFromDB() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. HELPER: Tool Formatter
-// ---------------------------------------------------------------------------
-// OpenAI expects pure JSON for tool definitions in session updates.
-function formatForOpenAI(toolList) {
-  return toolList.map(t => {
-    if (t.definition) return { type: 'function', ...t.definition }
-    return t
-  })
-}
-
-// ---------------------------------------------------------------------------
-// 3. SERVER
+// 2. SERVER
 // ---------------------------------------------------------------------------
 
 await loadPromptsFromDB()
@@ -67,38 +56,15 @@ wss.on('connection', (ws, req) => {
   
   console.log('[WS] New Connection')
 
-  let session = null 
+  // --- VARIABLES (The Closure Trick) ---
+  // We declare these upfront so the tools can reference them 
+  // even though they aren't initialized yet.
+  let session = null;
+  let routerAgent = null;
+  let pickupAgent = null;
+  let itemsAgent = null;
 
-  // --- HELPER: Manual Session Update (The Fix) ---
-  // This bypasses SDK limitations to force a "Brain Transplant" mid-call.
-  const dispatchSessionUpdate = async (instructions, tools) => {
-    console.log('[Session] Updating Tools/Prompt...')
-    
-    const event = {
-      type: 'session.update',
-      session: {
-        instructions: instructions,
-        tools: tools,
-      }
-    }
-
-    // Attempt to find the correct send method on the session or transport
-    try {
-        if (session.client && typeof session.client.send === 'function') {
-            session.client.send(event)
-        } else if (session.transport && typeof session.transport.send === 'function') {
-            session.transport.send(event)
-        } else if (typeof session.send === 'function') {
-            session.send(event)
-        } else {
-            console.error('[Error] Could not find a way to send session.update!')
-        }
-    } catch (err) {
-        console.error('[Error] Failed to dispatch session update:', err)
-    }
-  }
-
-  // --- A. Define CORE Tools ---
+  // --- A. Define BUSINESS Tools ---
 
   const pickupTool = tool({
     name: 'get_pickup_times',
@@ -136,88 +102,82 @@ wss.on('connection', (ws, req) => {
   })
 
   // --- B. Define NAVIGATION Tools ---
-  
-  const pickupToolsList = [pickupTool] 
-  const itemsToolsList = [itemInfoTool]
-  
-  // 1. Transfer TO Pickup
+
   const transferToPickup = tool({
     name: 'transfer_to_pickup',
-    description: 'Transfer to pickup department.',
+    description: 'Transfer caller to the pickup scheduling department.',
     parameters: z.object({}),
     execute: async () => {
-      console.log('🔄 Switching to Pickup')
-      // Inject "Back" button into the new state
-      const toolsForPickup = [...pickupToolsList, transferToRouter]
-      await dispatchSessionUpdate(PROMPTS.pickup, formatForOpenAI(toolsForPickup));
+      console.log('🔄 Switching to Pickup Agent')
+      // Uses the 'pickupAgent' variable which will be defined by the time this runs
+      await session.updateAgent(pickupAgent) 
       return "Transferring you to the pickup specialist."
     }
   })
 
-  // 2. Transfer TO Items
   const transferToItems = tool({
     name: 'transfer_to_items',
-    description: 'Transfer to item department.',
+    description: 'Transfer caller to the item information department.',
     parameters: z.object({}),
     execute: async () => {
-      console.log('🔄 Switching to Items')
-      const toolsForItems = [...itemsToolsList, transferToRouter]
-      await dispatchSessionUpdate(PROMPTS.items, formatForOpenAI(toolsForItems));
+      console.log('🔄 Switching to Items Agent')
+      await session.updateAgent(itemsAgent)
       return "Transferring you to the item specialist."
     }
   })
 
-  // 3. Transfer BACK to Router
   const transferToRouter = tool({
     name: 'transfer_to_main_menu',
-    description: 'Go back to the main menu.',
+    description: 'Go back to the main menu/receptionist.',
     parameters: z.object({}),
     execute: async () => {
-      console.log('🔄 Switching to Router')
-      const toolsForRouter = [transferToPickup, transferToItems]
-      await dispatchSessionUpdate(PROMPTS.router, formatForOpenAI(toolsForRouter));
-      return "Transferring you to the main menu."
+      console.log('🔄 Switching to Router Agent')
+      await session.updateAgent(routerAgent)
+      return "One moment, let me get the receptionist."
     }
   })
 
-  // --- C. Master Logic ---
+  // --- C. Initialize Agents ---
+  // Now we create the agents using the tools we just defined.
+  // Note: We do NOT use .addTool(). We pass the array in the constructor.
 
-  // CRITICAL: We register ALL tools locally so the code never crashes 
-  // if OpenAI asks for a function we supposedly removed.
-  const allTools = [
-    pickupTool,
-    itemInfoTool,
-    transferToPickup,
-    transferToItems,
-    transferToRouter
-  ]
+  pickupAgent = new RealtimeAgent({
+    name: 'Pickup Specialist',
+    instructions: PROMPTS.pickup,
+    tools: [pickupTool, transferToRouter], // Has the business tool + back button
+  })
 
-  const masterAgent = new RealtimeAgent({
-    name: 'Chasdei Lev Logic Core',
-    instructions: PROMPTS.router, 
-    tools: allTools, 
+  itemsAgent = new RealtimeAgent({
+    name: 'Item Specialist',
+    instructions: PROMPTS.items,
+    tools: [itemInfoTool, transferToRouter], // Has the business tool + back button
+  })
+
+  routerAgent = new RealtimeAgent({
+    name: 'Router',
+    instructions: PROMPTS.router,
+    tools: [transferToPickup, transferToItems], // Can only transfer
   })
 
   // --- D. Start Session ---
 
-  session = new RealtimeSession(masterAgent, {
+  session = new RealtimeSession(routerAgent, {
     transport: new TwilioRealtimeTransportLayer({ twilioWebSocket: ws }),
     model: 'gpt-realtime',
     config: {
       audio: { output: { voice: 'verse' } },
-      // Start with ONLY Router tools visible to the AI
-      tools: formatForOpenAI([transferToPickup, transferToItems]) 
     }
   })
 
   session.connect({ apiKey: OPENAI_API_KEY })
     .then(() => {
       console.log('✅ Connected to OpenAI')
-      // We use the method PROVEN to work in your first version
-      session.sendMessage('GREETING_TRIGGER')
+      if (session.sendMessage) {
+        session.sendMessage('GREETING_TRIGGER')
+      }
     })
     .catch(err => {
-      console.error(err)
+      console.error('[Session Error]', err)
       ws.close()
     })
 })
