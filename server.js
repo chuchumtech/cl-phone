@@ -11,7 +11,9 @@ dotenv.config()
 
 const { OPENAI_API_KEY, PORT = 8080 } = process.env
 
-// --- PROMPTS ---
+// ---------------------------------------------------------------------------
+// 1. PROMPT LOADER
+// ---------------------------------------------------------------------------
 const PROMPTS = {
   router: 'You are Leivi. Greet user. If pickup, say "Let me check the schedule..." -> transfer_to_pickup. If items, say "Let me check that item..." -> transfer_to_items. If sheitels/wigs, say "Let me check the wig calendar..." -> transfer_to_sheitel.',
   pickup: 'You are Leivi (Pickup Mode). Answer schedule questions. If user needs items/wigs, call transfer_to_main_menu.',
@@ -34,15 +36,68 @@ async function loadPromptsFromDB() {
       if (row.key === 'agent_sheitel') PROMPTS.sheitel = row.content
     })
     console.log('[System] Prompts Loaded')
-  } catch (e) { console.error(e) }
+  } catch (e) { console.error('[System] DB Error', e) }
 }
 
-// --- API HELPERS ---
+// ---------------------------------------------------------------------------
+// 2. API HELPERS
+// ---------------------------------------------------------------------------
 
-// ... (Keep getPickupTimes and getItemRecords here) ...
+const LOCATION_SYNONYMS = {
+  'boro park': { region: 'Brooklyn' },
+  boropark: { region: 'Brooklyn' },
+  flatbush: { region: 'Brooklyn' },
+  brooklyn: { region: 'Brooklyn' },
+  lakewood: { region: 'Lakewood' },
+  monsey: { region: 'Monsey' },
+  'five towns': { region: 'Five Towns' },
+}
+
+function normalizeLocation(raw) {
+  if (!raw) return {}
+  const key = raw.toLowerCase().trim()
+  const mapped = LOCATION_SYNONYMS[key]
+  if (mapped?.region) return { region: mapped.region }
+  if (mapped?.city) return { region: mapped.city }
+  return { region: raw }
+}
+
+async function getPickupTimes({ region, city }) {
+  const norm = normalizeLocation(city || region)
+  const params = new URLSearchParams()
+  if (norm.region) params.set('region', norm.region)
+  
+  const apiUrl = `https://phone.chuchumtech.com/api/pickup-times?${params.toString()}`
+  console.log('[Pickup API] Fetching:', apiUrl)
+
+  try {
+    const res = await fetch(apiUrl)
+    if (!res.ok) throw new Error('Pickup API error')
+    const json = await res.json()
+    return json.results || []
+  } catch (e) {
+    console.error(e)
+    return []
+  }
+}
+
+async function getItemRecords({ itemQuery }) {
+  if (!itemQuery || !itemQuery.trim()) return []
+  const search = itemQuery.trim()
+  const { data, error } = await supabase
+    .from('cl_items_kashrus')
+    .select('*')
+    .or(`item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`)
+    .limit(5)
+  
+  if (error) {
+    console.error('[DB] Item search error:', error)
+    return []
+  }
+  return data || []
+}
 
 async function getSheitelSales() {
-    // We only select date and region. We intentionally do NOT select the address.
     const { data, error } = await supabase
         .from('cl_sheitel_sales')
         .select('event_date, region') 
@@ -58,9 +113,12 @@ async function getSheitelSales() {
     return data || []
 }
 
-// --- SERVER ---
+// ---------------------------------------------------------------------------
+// 3. SERVER
+// ---------------------------------------------------------------------------
 
 await loadPromptsFromDB()
+
 const wss = new WebSocketServer({ port: PORT })
 
 wss.on('connection', (ws, req) => {
@@ -71,27 +129,85 @@ wss.on('connection', (ws, req) => {
   let routerAgent = null;
   let pickupAgent = null;
   let itemsAgent = null;
-  let sheitelAgent = null; // New Agent Variable
+  let sheitelAgent = null;
 
   // --- BUSINESS TOOLS ---
 
-  // ... (Keep pickupTool and itemInfoTool here) ...
+  const pickupTool = tool({
+    name: 'get_pickup_times',
+    description: 'Get pickup dates/times/addresses.',
+    parameters: z.object({
+      region: z.string().nullable().describe('Region name e.g. Brooklyn'),
+      city: z.string().nullable().describe('City name e.g. Lakewood'),
+    }),
+    execute: async ({ region, city }) => {
+      try {
+        const results = await getPickupTimes({ region, city })
+        if (!results.length) return { spoken_text: await speakAnswer('pickup_not_found', { city, region }) }
+        
+        const first = results[0]
+        const cityLabel = first.region || first.city || city || region || 'your location'
+        
+        if (first.is_tbd) return { spoken_text: await speakAnswer('pickup_tbd', { city: cityLabel }) }
+
+        const spoken_text = await speakAnswer('pickup_success', { 
+            city: cityLabel, 
+            date_spoken: first.event_date || first.date, 
+            time_window: `${first.start_time} to ${first.end_time}`, 
+            address: first.full_address 
+        })
+        return { spoken_text, data: first }
+      } catch (e) {
+        console.error(e)
+        return { spoken_text: "I'm having trouble accessing the schedule right now." }
+      }
+    },
+  })
+
+  const itemInfoTool = tool({
+    name: 'get_item_info',
+    description: 'Get kashrus or description for an item.',
+    parameters: z.object({
+      item_query: z.string(),
+      focus: z.enum(['kashrus', 'description', 'both']),
+    }),
+    execute: async ({ item_query, focus }) => {
+      try {
+        const items = await getItemRecords({ itemQuery: item_query })
+        if (!items.length) return { spoken_text: await speakAnswer('item_not_found', {}) }
+        if (items.length > 1) {
+          const names = items.map(i => i.item).join(', ')
+          return { spoken_text: await speakAnswer('item_ambiguous', { options: names }) }
+        }
+
+        const item = items[0]
+        let key = 'item_full'
+        if (focus === 'kashrus') key = 'item_kashrus_only'
+        else if (focus === 'description') key = 'item_description_only'
+
+        const spoken_text = await speakAnswer(key, {
+            item: item.item,
+            hechsher: item.hechsher || 'unknown',
+            description: item.description || ''
+        })
+        return { spoken_text, data: item }
+      } catch (e) {
+        return { spoken_text: "I'm having trouble accessing the item database." }
+      }
+    },
+  })
 
   const sheitelTool = tool({
     name: 'get_sheitel_sales',
     description: 'Check for upcoming wig/sheitel sales.',
-    parameters: z.object({}), // No parameters needed, just checks the calendar
+    parameters: z.object({}), 
     execute: async () => {
       const sales = await getSheitelSales()
-      
       if (!sales || !sales.length) {
           return { spoken_text: await speakAnswer('sheitel_none', {}) }
       }
-
       const sale = sales[0]
-      // Format date for speech
       const dateSpoken = new Date(sale.event_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
-
       return { 
           spoken_text: await speakAnswer('sheitel_upcoming', { 
               region: sale.region, 
@@ -103,7 +219,39 @@ wss.on('connection', (ws, req) => {
 
   // --- NAVIGATION TOOLS ---
 
-  // ... (Keep transferToPickup and transferToItems here) ...
+  const transferToPickup = tool({
+    name: 'transfer_to_pickup',
+    description: 'Use this to look up schedule info.',
+    parameters: z.object({
+      summary: z.string().describe('The user question')
+    }),
+    execute: async ({ summary }) => {
+      console.log(`[Switch] -> Pickup | Context: ${summary}`)
+      await session.updateAgent(pickupAgent)
+      
+      if (summary) {
+        setTimeout(() => { if(session) session.sendMessage(summary) }, 2500)
+      }
+      return "..." 
+    }
+  })
+
+  const transferToItems = tool({
+    name: 'transfer_to_items',
+    description: 'Use this to look up item info.',
+    parameters: z.object({
+      summary: z.string().describe('The user question')
+    }),
+    execute: async ({ summary }) => {
+      console.log(`[Switch] -> Items | Context: ${summary}`)
+      await session.updateAgent(itemsAgent)
+      
+      if (summary) {
+        setTimeout(() => { if(session) session.sendMessage(summary) }, 2500)
+      }
+      return "..."
+    }
+  })
 
   const transferToSheitel = tool({
       name: 'transfer_to_sheitel',
@@ -161,7 +309,7 @@ wss.on('connection', (ws, req) => {
   routerAgent = new RealtimeAgent({
     name: 'Router Brain',
     instructions: PROMPTS.router,
-    tools: [transferToPickup, transferToItems, transferToSheitel], // Added new transfer tool
+    tools: [transferToPickup, transferToItems, transferToSheitel],
   })
 
   // --- SESSION ---
