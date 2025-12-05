@@ -408,11 +408,22 @@ wss.on('connection', (ws, req) => {
     tools: [transferToPickup, transferToItems, transferToSheitel],
   })
 
-  // -------------------------------------------------------------------------
-  // SESSION
-  // -------------------------------------------------------------------------
+  // Decide which agent to start with based on "source"
+  let initialAgent = routerAgent
 
-  session = new RealtimeSession(routerAgent, {
+  if (source === 'ivr_rebbi_pickup') {
+    initialAgent = pickupAgent
+  } else if (source === 'ivr_rebbi_items') {
+    initialAgent = itemsAgent
+  } else if (source === 'ivr_rebbi_sheitel') {
+    initialAgent = sheitelAgent
+  }
+
+  console.log('[WS] Initial agent:', initialAgent.name)
+
+  // --- SESSION ---
+
+  session = new RealtimeSession(initialAgent, {
     transport: new TwilioRealtimeTransportLayer({ twilioWebSocket: ws }),
     model: 'gpt-realtime',
     config: {
