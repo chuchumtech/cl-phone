@@ -143,17 +143,16 @@ await loadPromptsFromDB()
 const wss = new WebSocketServer({ port: PORT })
 
 wss.on('connection', (ws, req) => {
-  // Parse the full URL so we can safely read pathname + query
-  const fullUrl = new URL(req.url, 'wss://cl-phone.onrender.com')
-
-  const pathname = fullUrl.pathname
-  const source = fullUrl.searchParams.get('source') || 'direct'
+  // IMPORTANT: properly parse path + query (handles ?source=ivr_rebbi etc)
+  const parsedUrl = new URL(req.url, 'http://localhost')
+  const pathname = parsedUrl.pathname
+  const source = parsedUrl.searchParams.get('source') || 'direct'
 
   console.log('[WS] New Connection:', { pathname, source })
 
-  // Only accept connections on /twilio-stream
+  // Only accept /twilio-stream
   if (pathname !== '/twilio-stream') {
-    console.log('[WS] Unknown path, closing')
+    console.log('[WS] Unknown path, closing:', pathname)
     ws.close()
     return
   }
