@@ -1,6 +1,4 @@
 import dotenv from 'dotenv'
-import http from 'http'
-import url from 'url'
 import { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
@@ -144,8 +142,9 @@ await loadPromptsFromDB()
 const wss = new WebSocketServer({ port: PORT })
 
 wss.on('connection', (ws, req) => {
-  const { pathname, query } = url.parse(req.url || '', true)
-  const source = query?.source || 'direct'
+  const { pathname, query } = parseUrl(req.url || '', true)
+  const source = (query?.source || 'direct')
+  const isFromIvr = typeof source === 'string' && source.startsWith('ivr_')
 
   console.log('[WS] New Connection:', { pathname, source })
 
@@ -155,6 +154,7 @@ wss.on('connection', (ws, req) => {
     ws.close()
     return
   }
+
   console.log('[WS] New Connection. source =', source)
 
   let session = null
@@ -257,7 +257,7 @@ wss.on('connection', (ws, req) => {
   const sheitelTool = tool({
     name: 'get_sheitel_sales',
     description: 'Check for upcoming wig/sheitel sales.',
-    parameters: z.object({}), // no inputs
+    parameters: z.object({}),
     execute: async () => {
       try {
         const sales = await getSheitelSales()
@@ -355,8 +355,8 @@ wss.on('connection', (ws, req) => {
     parameters: z.object({}),
     execute: async () => {
       // If call came from IVR (e.g. Rebbi menu), go back to IVR instead of router agent
-      if (source === 'ivr_rebbi') {
-        console.log('[Switch] -> Back to IVR Rebbi menu (closing WS)')
+      if (isFromIvr) {
+        console.log('[Switch] -> Back to IVR (closing WS), source =', source)
         // tiny delay so the model can finish its last sentence
         setTimeout(() => {
           try {
@@ -368,7 +368,7 @@ wss.on('connection', (ws, req) => {
         return '...'
       }
 
-      console.log('[Switch] -> Router agent')
+      console.log('[Switch] -> Router agent (direct call)')
       await session.updateAgent(routerAgent)
 
       setTimeout(() => {
@@ -449,7 +449,12 @@ wss.on('connection', (ws, req) => {
     () => {
       console.log('[Session] ✅ Connected to OpenAI')
       if (session.sendMessage) {
-        session.sendMessage('GREETING_TRIGGER')
+        // IVR pickup gets a special greeting token; everything else uses router greeting
+        if (source === 'ivr_rebbi_pickup') {
+          session.sendMessage('PICKUP_DIRECT_GREETING')
+        } else {
+          session.sendMessage('GREETING_TRIGGER')
+        }
       }
     },
     (err) => {
