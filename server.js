@@ -106,7 +106,9 @@ async function getItemRecords({ itemQuery }) {
   const { data, error } = await supabase
     .from('cl_items_kashrus')
     .select('*')
-    .or(`item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`)
+    .or(
+      `item.ilike.%${search}%,description.ilike.%${search}%,aka_name.ilike.%${search}%`
+    )
     .limit(5)
 
   if (error) {
@@ -143,19 +145,16 @@ const wss = new WebSocketServer({ port: PORT })
 
 wss.on('connection', (ws, req) => {
   const { pathname, query } = parseUrl(req.url || '', true)
-  const source = (query?.source || 'direct')
-  const isFromIvr = typeof source === 'string' && source.startsWith('ivr_')
 
-  console.log('[WS] New Connection:', { pathname, source })
-
-  // Only accept /twilio-stream
   if (pathname !== '/twilio-stream') {
     console.log('[WS] Unknown path, closing:', pathname)
     ws.close()
     return
   }
 
-  console.log('[WS] New Connection. source =', source)
+  // Default source from URL query (if Twilio ever passes it)
+  let source = (query?.source || 'direct').toString()
+  console.log('[WS] New Connection: { pathname:', pathname, ', urlSource:', source, '}')
 
   let session = null
   let routerAgent = null
@@ -184,7 +183,8 @@ wss.on('connection', (ws, req) => {
         }
 
         const first = results[0]
-        const cityLabel = first.region || first.city || city || region || 'your location'
+        const cityLabel =
+          first.region || first.city || city || region || 'your location'
 
         if (first.is_tbd) {
           return {
@@ -257,7 +257,7 @@ wss.on('connection', (ws, req) => {
   const sheitelTool = tool({
     name: 'get_sheitel_sales',
     description: 'Check for upcoming wig/sheitel sales.',
-    parameters: z.object({}),
+    parameters: z.object({}), // no inputs
     execute: async () => {
       try {
         const sales = await getSheitelSales()
@@ -354,10 +354,9 @@ wss.on('connection', (ws, req) => {
     description: 'Use this when the user wants to switch topics.',
     parameters: z.object({}),
     execute: async () => {
-      // If call came from IVR (e.g. Rebbi menu), go back to IVR instead of router agent
-      if (isFromIvr) {
-        console.log('[Switch] -> Back to IVR (closing WS), source =', source)
-        // tiny delay so the model can finish its last sentence
+      // If coming from any IVR source, close WS so Twilio returns to IVR flow
+      if (source && source.startsWith('ivr_')) {
+        console.log('[Switch] -> Back to IVR (closing WS). source =', source)
         setTimeout(() => {
           try {
             ws.close()
@@ -368,7 +367,7 @@ wss.on('connection', (ws, req) => {
         return '...'
       }
 
-      console.log('[Switch] -> Router agent (direct call)')
+      console.log('[Switch] -> Router agent (internal)')
       await session.updateAgent(routerAgent)
 
       setTimeout(() => {
@@ -380,7 +379,7 @@ wss.on('connection', (ws, req) => {
   })
 
   // -------------------------------------------------------------------------
-  // AGENTS
+  // AGENTS (created once per connection)
   // -------------------------------------------------------------------------
 
   pickupAgent = new RealtimeAgent({
@@ -407,22 +406,12 @@ wss.on('connection', (ws, req) => {
     tools: [transferToPickup, transferToItems, transferToSheitel],
   })
 
-  // Decide which agent to start with based on "source"
-  let initialAgent = routerAgent
+  // -------------------------------------------------------------------------
+  // SESSION - start with router by default
+  // We'll switch after we parse Twilio's "start" event if needed
+  // -------------------------------------------------------------------------
 
-  if (source === 'ivr_rebbi_pickup') {
-    initialAgent = pickupAgent
-  } else if (source === 'ivr_rebbi_items') {
-    initialAgent = itemsAgent
-  } else if (source === 'ivr_rebbi_sheitel') {
-    initialAgent = sheitelAgent
-  }
-
-  console.log('[WS] Initial agent:', initialAgent.name)
-
-  // --- SESSION ---
-
-  session = new RealtimeSession(initialAgent, {
+  session = new RealtimeSession(routerAgent, {
     transport: new TwilioRealtimeTransportLayer({ twilioWebSocket: ws }),
     model: 'gpt-realtime',
     config: {
@@ -434,9 +423,38 @@ wss.on('connection', (ws, req) => {
     },
   })
 
+  // Listen to Twilio Media Stream "start" event to pick up customParameters.source
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString())
+      if (msg.event === 'start' && msg.start?.customParameters) {
+        const customSource = msg.start.customParameters.source
+        if (customSource) {
+          source = customSource.toString()
+          console.log('[WS] Detected source from Twilio customParameters:', source)
+        }
+
+        // Decide which agent should handle this call based on source
+        let targetAgent = routerAgent
+        if (source === 'ivr_rebbi_pickup') targetAgent = pickupAgent
+        else if (source === 'ivr_rebbi_items') targetAgent = itemsAgent
+        else if (source === 'ivr_rebbi_sheitel') targetAgent = sheitelAgent
+
+        console.log('[WS] Switching initial agent to:', targetAgent.name)
+        session.updateAgent(targetAgent)
+
+        // Now that we know where they came from, fire the greeting
+        if (session.sendMessage) {
+          session.sendMessage('GREETING_TRIGGER')
+        }
+      }
+    } catch (_e) {
+      // Non-JSON media frame: ignore
+    }
+  })
+
   session.on('error', (err) => {
     const msg = err?.message || JSON.stringify(err)
-    // Ignore "active_response" chatter from interruptions
     if (msg.includes('active_response')) return
     console.error('[Session Error]', msg)
   })
@@ -445,23 +463,19 @@ wss.on('connection', (ws, req) => {
     console.log('[Session] Response completed')
   })
 
-  session.connect({ apiKey: OPENAI_API_KEY }).then(
-    () => {
-      console.log('[Session] ✅ Connected to OpenAI')
-      if (session.sendMessage) {
-        // IVR pickup gets a special greeting token; everything else uses router greeting
-        if (source === 'ivr_rebbi_pickup') {
-          session.sendMessage('PICKUP_DIRECT_GREETING')
-        } else {
-          session.sendMessage('GREETING_TRIGGER')
-        }
+  session
+    .connect({ apiKey: OPENAI_API_KEY })
+    .then(
+      () => {
+        console.log('[Session] ✅ Connected to OpenAI')
+        // NOTE: We do NOT send GREETING_TRIGGER here anymore.
+        // It is sent after we detect Twilio "start" and know the source.
+      },
+      (err) => {
+        console.error('[Session] Failed to connect to OpenAI:', err)
+        ws.close()
       }
-    },
-    (err) => {
-      console.error('[Session] Failed to connect to OpenAI:', err)
-      ws.close()
-    }
-  )
+    )
 
   ws.on('close', () => {
     console.log('[WS] Twilio stream closed')
