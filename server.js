@@ -143,10 +143,8 @@ await loadPromptsFromDB()
 const wss = new WebSocketServer({ port: PORT })
 
 wss.on('connection', (ws, req) => {
-  // IMPORTANT: properly parse path + query (handles ?source=ivr_rebbi etc)
-  const parsedUrl = new URL(req.url, 'http://localhost')
-  const pathname = parsedUrl.pathname
-  const source = parsedUrl.searchParams.get('source') || 'direct'
+  const { pathname, query } = url.parse(req.url || '', true)
+  const source = query?.source || 'direct'
 
   console.log('[WS] New Connection:', { pathname, source })
 
