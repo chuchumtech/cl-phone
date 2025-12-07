@@ -10,7 +10,7 @@ dotenv.config()
 const {
   OPENAI_API_KEY,
   PORT = 8080,
-  PROMPT_REFRESH_SECRET,   // for /refresh-prompts button
+  PROMPT_REFRESH_SECRET,
   ROUTER_ENDPOINT,
   ITEM_SEARCH_ENDPOINT,
 } = process.env
@@ -87,7 +87,7 @@ const httpServer = http.createServer(async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
-// 3. WS SERVER (Twilio <-> OpenAI Realtime bridge)
+// 3. WS SERVER (Twilio <-> OpenAI Realtime)
 // ---------------------------------------------------------------------------
 
 const wss = new WebSocketServer({ server: httpServer })
@@ -106,7 +106,6 @@ wss.on('connection', async (twilioWs, req) => {
 
   console.log('[WS] New Twilio media stream connection')
 
-  // Connect to OpenAI Realtime
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
     {
@@ -120,9 +119,38 @@ wss.on('connection', async (twilioWs, req) => {
   let isAssistantSpeaking = false
   let currentAgent = 'router'
   let callSid = null
+  let openaiReady = false
+  let twilioStarted = false
+  let greetingSent = false
 
-  // Map call_id -> toolName for function calling
+  // Map: call_id -> toolName for function calling
   const functionCallMap = new Map()
+
+  function maybeSendGreeting() {
+    if (!openaiReady || !twilioStarted || greetingSent) return
+
+    greetingSent = true
+    console.log('[Greeting] Sending GREETING_TRIGGER to OpenAI')
+
+    // Trigger greeting
+    openaiWs.send(
+      JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'GREETING_TRIGGER',
+            },
+          ],
+        },
+      })
+    )
+
+    openaiWs.send(JSON.stringify({ type: 'response.create' }))
+  }
 
   // ---------------- OpenAI WS: on open ----------------
 
@@ -132,14 +160,15 @@ wss.on('connection', async (twilioWs, req) => {
     const routerPrompt =
       PROMPTS.router || 'You are the Chasdei Lev router agent.'
 
-    // Configure initial session (router)
     openaiWs.send(
       JSON.stringify({
         type: 'session.update',
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'cedar',               // Leivi voice
+          // Use a known-good voice for gpt-4o-realtime-preview
+          // (alloy, ash, ballad, coral, echo, sage, shimmer, verse)
+          voice: 'cedar',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -162,24 +191,8 @@ wss.on('connection', async (twilioWs, req) => {
       })
     )
 
-    // Trigger initial greeting via GREETING_TRIGGER
-    openaiWs.send(
-      JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: 'GREETING_TRIGGER',
-            },
-          ],
-        },
-      })
-    )
-
-    openaiWs.send(JSON.stringify({ type: 'response.create' }))
+    openaiReady = true
+    maybeSendGreeting()
   })
 
   // ---------------- Twilio -> OpenAI ----------------
@@ -191,11 +204,12 @@ wss.on('connection', async (twilioWs, req) => {
       if (msg.event === 'start') {
         callSid = msg.start?.callSid || null
         console.log('[Twilio] Call started', callSid)
+        twilioStarted = true
+        maybeSendGreeting()
       }
 
       if (msg.event === 'media') {
         if (!isAssistantSpeaking) {
-          // forward μ-law audio to OpenAI
           openaiWs.send(
             JSON.stringify({
               type: 'input_audio_buffer.append',
@@ -203,7 +217,7 @@ wss.on('connection', async (twilioWs, req) => {
             })
           )
         } else {
-          // Ignore caller when Leivi is speaking
+          // Ignore caller audio while assistant is speaking
         }
       }
 
@@ -214,7 +228,7 @@ wss.on('connection', async (twilioWs, req) => {
         } catch {}
       }
     } catch {
-      // Non-JSON frames from Twilio are ignored
+      // ignore non-JSON frames
     }
   })
 
@@ -236,8 +250,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
-    // Uncomment for deep debugging:
-    // console.log('[OpenAI evt]', event.type)
+    console.log('[OpenAI evt]', event.type)
 
     switch (event.type) {
       // ---- AUDIO OUT ----
@@ -248,7 +261,7 @@ wss.on('connection', async (twilioWs, req) => {
           twilioWs.send(
             JSON.stringify({
               event: 'media',
-              media: { payload: b64 }, // g711_ulaw base64
+              media: { payload: b64 }, // base64 g711_ulaw
             })
           )
         }
@@ -256,19 +269,18 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.output_audio.done': {
-        // audio for this output finished; we'll also rely on response.done
+        // audio finished for this response (we also rely on response.done)
         break
       }
 
       case 'response.done': {
-        // full response finished (text+audio); safe to listen again
+        // Full response finished; safe to listen again
         isAssistantSpeaking = false
         break
       }
 
-      // ---- TEXT OUT (for debugging or JSON handoff if you ever use it) ----
+      // ---- TEXT OUT (optionally carry handoff JSON if you want) ----
       case 'response.output_text.delta': {
-        // if you ever embed JSON handoff blobs in plain text, you can detect them here
         const text = event.delta
         if (text && looksLikeHandoff(text)) {
           const handoff = JSON.parse(text)
@@ -277,24 +289,22 @@ wss.on('connection', async (twilioWs, req) => {
         break
       }
 
-      // ---- FUNCTION CALLING (TOOLS) ----
+      // ---- FUNCTION CALL LIFECYCLE ----
       case 'response.output_item.added': {
-        // if the item is a function_call, remember which tool name belongs to call_id later
         const item = event.item
         if (item?.type === 'function_call') {
           const toolName = item.name
           const callId = item.call_id
           if (callId && toolName) {
             functionCallMap.set(callId, toolName)
-            // console.log('[Tool] function_call started', callId, toolName)
+            console.log('[Tool] function_call started', callId, toolName)
           }
         }
         break
       }
 
       case 'response.function_call_arguments.delta': {
-        // We could stream-accumulate arguments here if needed.
-        // We'll just wait for .done to get the full JSON.
+        // We could accumulate args here; we wait for .done
         break
       }
 
@@ -310,7 +320,7 @@ wss.on('connection', async (twilioWs, req) => {
 
         const toolName = functionCallMap.get(callId)
         if (!toolName) {
-          console.warn('[Tool] Unknown call_id (no toolName):', callId)
+          console.warn('[Tool] Unknown call_id:', callId)
           break
         }
 
@@ -358,7 +368,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   // -------------------------------------------------------------------------
   // 5. TOOL CALL HANDLING (determine_route, search_items)
-  // -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
   async function handleToolCall(toolName, args, callId) {
     try {
@@ -376,7 +386,7 @@ wss.on('connection', async (twilioWs, req) => {
 
         const output = resp.data || {}
 
-        // Attach function_call_output to the conversation
+        // Attach function_call_output
         openaiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
@@ -388,10 +398,9 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
-        // Trigger model to speak / respond based on that output
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
 
-        // If router says to hand off, we could also detect and call handleHandoff() here
+        // Optionally: auto-handoff when router says so
         if (output.intent && output.intent === 'items') {
           await handleHandoff({
             handoff_from: 'router',
@@ -440,7 +449,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   // -------------------------------------------------------------------------
   // 6. AGENT SWITCHING (router <-> items)
-  // -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
   async function handleHandoff(h) {
     console.log('[Handoff]', h)
