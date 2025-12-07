@@ -1,4 +1,5 @@
 import dotenv from 'dotenv'
+import http from 'http'
 import WebSocket, { WebSocketServer } from 'ws'
 import { supabase } from './supabaseClient.js'
 import { parse as parseUrl } from 'url'
@@ -6,33 +7,81 @@ import axios from 'axios'
 
 dotenv.config()
 
-const { OPENAI_API_KEY, PORT = 8080 } = process.env
+const {
+  OPENAI_API_KEY,
+  PORT = 8080,
+  PROMPT_REFRESH_SECRET, // set this in Render env
+} = process.env
 
 if (!OPENAI_API_KEY) {
   console.error('[Fatal] Missing OPENAI_API_KEY')
   process.exit(1)
 }
 
-// ---------------- PROMPTS FROM DB ----------------
+// ---------------- PROMPT CACHE ----------------
 
-async function loadAgentPrompt(slug) {
-  const { data, error } = await supabase
-    .from('cl_phone_agents')
-    .select('system_prompt')
-    .eq('slug', slug)
-    .single()
-
-  if (error) {
-    console.error('[DB] Error loading prompt for', slug, error)
-    return ''
-  }
-  return data.system_prompt || ''
+const PROMPTS = {
+  router: '',
+  items: '',
 }
 
-// ---------------- START WS SERVER ----------------
+async function reloadPromptsFromDB() {
+  try {
+    const { data, error } = await supabase
+      .from('cl_phone_agents')
+      .select('slug, system_prompt')
+      .in('slug', ['router', 'items'])
 
-const wss = new WebSocketServer({ port: PORT })
-console.log(`[server] Listening for Twilio WS on port ${PORT}`)
+    if (error) {
+      console.error('[Prompts] Error loading from DB:', error)
+      return
+    }
+
+    for (const row of data || []) {
+      if (row.slug === 'router') PROMPTS.router = row.system_prompt || ''
+      if (row.slug === 'items') PROMPTS.items = row.system_prompt || ''
+    }
+
+    console.log('[Prompts] Reloaded:',
+      'router=', PROMPTS.router ? 'OK' : 'MISSING',
+      'items=', PROMPTS.items ? 'OK' : 'MISSING'
+    )
+  } catch (e) {
+    console.error('[Prompts] Unexpected error reloading:', e)
+  }
+}
+
+// Initial load on startup
+await reloadPromptsFromDB()
+
+// ---------------- HTTP SERVER (for refresh) ----------------
+
+const httpServer = http.createServer(async (req, res) => {
+  // Simple endpoint: POST /refresh-prompts
+  if (req.method === 'POST' && req.url === '/refresh-prompts') {
+    const authHeader = req.headers['authorization'] || ''
+    if (!PROMPT_REFRESH_SECRET || authHeader !== `Bearer ${PROMPT_REFRESH_SECRET}`) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' })
+      return res.end('unauthorized')
+    }
+
+    await reloadPromptsFromDB()
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    return res.end('ok')
+  }
+
+  // Everything else: 404
+  res.writeHead(404, { 'Content-Type': 'text/plain' })
+  res.end('not found')
+})
+
+// ---------------- WS SERVER (for Twilio) ----------------
+
+const wss = new WebSocketServer({ server: httpServer })
+
+httpServer.listen(PORT, () => {
+  console.log(`[server] Listening on port ${PORT} (HTTP + WS)`)
+})
 
 wss.on('connection', async (twilioWs, req) => {
   const { pathname } = parseUrl(req.url || '', true)
@@ -61,7 +110,7 @@ wss.on('connection', async (twilioWs, req) => {
   openaiWs.on('open', async () => {
     console.log('[OpenAI] Realtime session opened')
 
-    const routerPrompt = await loadAgentPrompt('router')
+    const routerPrompt = PROMPTS.router || 'You are the Chasdei Lev router agent.'
 
     // 1) Configure session
     openaiWs.send(
@@ -70,7 +119,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'verse',
+          voice: 'cedar',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -92,7 +141,7 @@ wss.on('connection', async (twilioWs, req) => {
       })
     )
 
-    // 2) Trigger initial greeting (no need for user to speak yet)
+    // 2) Trigger initial greeting
     openaiWs.send(
       JSON.stringify({
         type: 'conversation.item.create',
@@ -146,7 +195,7 @@ wss.on('connection', async (twilioWs, req) => {
   // 3) OpenAI → Twilio
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
-    console.log('[OpenAI evt]', event.type) // 👈 DEBUG: see everything
+    // console.log('[OpenAI evt]', event.type)
 
     // Audio stream from model
     if (event.type === 'response.output_audio.delta') {
@@ -175,13 +224,12 @@ wss.on('connection', async (twilioWs, req) => {
       }
     }
 
-    // Function calls from tools
+    // Function calls from tools (arguments streamed)
     if (event.type === 'response.function_call_arguments.delta') {
       const { name, arguments: args } = event
       await handleToolCall(name, args)
     }
 
-    // Any errors from server
     if (event.type === 'error') {
       console.error('[OpenAI error event]', event)
     }
@@ -242,7 +290,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     if (h.intent === 'items') {
       currentAgent = 'items'
-      const itemsPrompt = await loadAgentPrompt('items')
+      const itemsPrompt = PROMPTS.items || 'You are the Chasdei Lev items agent.'
 
       openaiWs.send(
         JSON.stringify({
@@ -284,7 +332,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     if (h.intent === 'router') {
       currentAgent = 'router'
-      const routerPrompt = await loadAgentPrompt('router')
+      const routerPrompt = PROMPTS.router || 'You are the Chasdei Lev router agent.'
 
       openaiWs.send(
         JSON.stringify({
