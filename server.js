@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-import { WebSocketServer } from 'ws'
+import WebSocket, { WebSocketServer } from 'ws'   // ✅ proper ws imports
 import { supabase } from './supabaseClient.js'
 import { parse as parseUrl } from 'url'
 import axios from 'axios'
@@ -69,7 +69,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'verse',            // 👈 choose voice here
+          voice: 'cedar',            // 👈 choose voice here
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
