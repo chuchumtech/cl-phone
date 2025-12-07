@@ -125,6 +125,7 @@ wss.on('connection', async (twilioWs, req) => {
           turn_detection: { type: 'server_vad' },
           tools: [
             {
+              type: 'function',
               name: 'determine_route',
               description: 'Classify caller intent',
               parameters: {
@@ -299,6 +300,7 @@ wss.on('connection', async (twilioWs, req) => {
             instructions: itemsPrompt,
             tools: [
               {
+                type: 'function',
                 name: 'search_items',
                 description: 'Search for Chasdei Lev items',
                 parameters: {
@@ -341,6 +343,7 @@ wss.on('connection', async (twilioWs, req) => {
             instructions: routerPrompt,
             tools: [
               {
+                type: 'function',
                 name: 'determine_route',
                 description: 'Classify caller intent',
                 parameters: {
