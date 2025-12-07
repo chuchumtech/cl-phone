@@ -1,3 +1,4 @@
+// server.js
 import dotenv from 'dotenv'
 import http from 'http'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -13,6 +14,7 @@ const {
   PROMPT_REFRESH_SECRET,
   ROUTER_ENDPOINT,
   ITEM_SEARCH_ENDPOINT,
+  PICKUP_ENDPOINT, // POST endpoint for pickup lookup
 } = process.env
 
 // ---------------------------------------------------------------------------
@@ -29,6 +31,9 @@ if (!ROUTER_ENDPOINT) {
 if (!ITEM_SEARCH_ENDPOINT) {
   console.warn('[Warn] ITEM_SEARCH_ENDPOINT not set – items tool will fail.')
 }
+if (!PICKUP_ENDPOINT) {
+  console.warn('[Warn] PICKUP_ENDPOINT not set – pickup tool will fail.')
+}
 
 // ---------------------------------------------------------------------------
 // 1. PROMPT CACHE
@@ -37,6 +42,7 @@ if (!ITEM_SEARCH_ENDPOINT) {
 const PROMPTS = {
   router: '',
   items: '',
+  pickup: '',
 }
 
 async function reloadPromptsFromDB() {
@@ -44,7 +50,7 @@ async function reloadPromptsFromDB() {
     const { data, error } = await supabase
       .from('cl_phone_agents')
       .select('slug, system_prompt')
-      .in('slug', ['router', 'items'])
+      .in('slug', ['router', 'items', 'locations'])
 
     if (error) {
       console.error('[Prompts] Error loading from DB:', error)
@@ -54,12 +60,14 @@ async function reloadPromptsFromDB() {
     for (const row of data || []) {
       if (row.slug === 'router') PROMPTS.router = row.system_prompt || ''
       if (row.slug === 'items') PROMPTS.items = row.system_prompt || ''
+      if (row.slug === 'locations') PROMPTS.pickup = row.system_prompt || ''
     }
 
     console.log(
       '[Prompts] Reloaded:',
       'router=', PROMPTS.router ? 'OK' : 'MISSING',
-      'items=', PROMPTS.items ? 'OK' : 'MISSING'
+      'items=', PROMPTS.items ? 'OK' : 'MISSING',
+      'pickup=', PROMPTS.pickup ? 'OK' : 'MISSING'
     )
   } catch (e) {
     console.error('[Prompts] Unexpected error reloading:', e)
@@ -110,7 +118,6 @@ wss.on('connection', async (twilioWs, req) => {
 
   console.log('[WS] New Twilio media stream connection')
 
-  // 3.1 Create OpenAI realtime socket
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
     {
@@ -171,7 +178,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'cedar', // or 'cedar' etc
+          voice: 'cedar',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -214,12 +221,11 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       if (msg.event === 'media') {
-        // Only listen when assistant is not speaking
         if (!isAssistantSpeaking) {
           openaiWs.send(
             JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: msg.media.payload, // base64 g711_ulaw from Twilio
+              audio: msg.media.payload,
             })
           )
         }
@@ -282,7 +288,6 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.audio_transcript.delta': {
-        // Build human-readable transcript line
         if (typeof event.delta === 'string') {
           currentAssistantTranscript += event.delta
         }
@@ -300,7 +305,6 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.audio.done': {
-        // audio stream finished; response.done will clean flags
         break
       }
 
@@ -310,7 +314,7 @@ wss.on('connection', async (twilioWs, req) => {
         break
       }
 
-      // ---- TEXT OUT / optional handoff via text ----
+      // ---- TEXT OUT / optional JSON handoff ----
       case 'response.output_text.delta': {
         const text = event.delta
         if (text && looksLikeHandoff(text)) {
@@ -335,7 +339,7 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.function_call_arguments.delta': {
-        // We ignore partial chunks; we handle the final combined args
+        // ignore partials
         break
       }
 
@@ -365,7 +369,6 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       default:
-        // ignore other event types for now
         break
     }
   })
@@ -385,7 +388,7 @@ wss.on('connection', async (twilioWs, req) => {
   })
 
   // -------------------------------------------------------------------------
-  // 4. HANDOFF DETECTOR (if we ever use textual JSON handoffs)
+  // 4. HANDOFF DETECTOR (JSON handoffs via text, if ever used)
 // ---------------------------------------------------------------------------
 
   function looksLikeHandoff(text) {
@@ -398,7 +401,7 @@ wss.on('connection', async (twilioWs, req) => {
   }
 
   // -------------------------------------------------------------------------
-  // 5. TOOL CALL HANDLING (determine_route, search_items)
+  // 5. TOOL CALL HANDLING
 // ---------------------------------------------------------------------------
 
   async function handleToolCall(toolName, args, callId) {
@@ -418,7 +421,6 @@ wss.on('connection', async (twilioWs, req) => {
 
         const output = resp.data || {}
 
-        // Must be a string
         openaiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
@@ -430,18 +432,22 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
-        // Do NOT send response.create here – we immediately hand off,
-        // to avoid conversation_already_has_active_response.
-        if (output.intent && output.intent === 'items') {
+        if (output.intent === 'items') {
           await handleHandoff({
             handoff_from: 'router',
             intent: 'items',
             question_type: output.question_type || 'specific',
             question: output.cleaned_question || null,
           })
+        } else if (output.intent === 'pickup') {
+          await handleHandoff({
+            handoff_from: 'router',
+            intent: 'pickup',
+            question_type: output.question_type || 'specific',
+            question: output.cleaned_question || null,
+          })
         }
 
-        // Could support other intents (pickup, orders) later
         return
       }
 
@@ -470,8 +476,63 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
-        // Now the items agent should speak the answer
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
+        return
+      }
+
+      // ---------- PICKUP TOOL ----------
+      if (toolName === 'search_pickup_locations') {
+        if (!PICKUP_ENDPOINT) {
+          console.error('[Tool] PICKUP_ENDPOINT not configured')
+          return
+        }
+
+        const resp = await axios.post(PICKUP_ENDPOINT, {
+          ...args,
+          call_sid: callSid,
+        })
+
+        const output = resp.data || {}
+
+        openaiWs.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'function_call_output',
+              call_id: callId,
+              output: JSON.stringify(output),
+            },
+          })
+        )
+
+        openaiWs.send(JSON.stringify({ type: 'response.create' }))
+        return
+      }
+
+      // ---------- HANDOFF TO ROUTER TOOL ----------
+      if (toolName === 'handoff_to_router') {
+        const cleanedQuestion =
+          typeof args.question === 'string' ? args.question : null
+
+        // Acknowledge the tool call (payload not used by the model)
+        openaiWs.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'function_call_output',
+              call_id: callId,
+              output: JSON.stringify({ ok: true }),
+            },
+          })
+        )
+
+        await handleHandoff({
+          handoff_from: currentAgent,
+          intent: 'router',
+          question_type: 'specific',
+          question: cleanedQuestion,
+        })
+
         return
       }
 
@@ -482,7 +543,7 @@ wss.on('connection', async (twilioWs, req) => {
   }
 
   // -------------------------------------------------------------------------
-  // 6. AGENT SWITCHING (router <-> items)
+  // 6. AGENT SWITCHING (router <-> items / pickup)
 // ---------------------------------------------------------------------------
 
   async function handleHandoff(h) {
@@ -513,12 +574,28 @@ wss.on('connection', async (twilioWs, req) => {
                   required: ['query'],
                 },
               },
+              {
+                type: 'function',
+                name: 'handoff_to_router',
+                description:
+                  'Return control to the router agent when the caller asks about something other than items.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    question: {
+                      type: 'string',
+                      description:
+                        'The caller’s latest question, cleaned up but without changing the meaning.',
+                    },
+                  },
+                  required: ['question'],
+                },
+              },
             ],
           },
         })
       )
 
-      // If router already has a full question, feed it in immediately
       if (h.question) {
         openaiWs.send(
           JSON.stringify({
@@ -537,7 +614,72 @@ wss.on('connection', async (twilioWs, req) => {
       return
     }
 
-    // ----- Items -> Router (or any agent -> router) -----
+    // ----- Router -> Pickup -----
+    if (h.intent === 'pickup') {
+      currentAgent = 'pickup'
+      const pickupPrompt =
+        PROMPTS.pickup || 'You are the Chasdei Lev pickup agent.'
+
+      openaiWs.send(
+        JSON.stringify({
+          type: 'session.update',
+          session: {
+            instructions: pickupPrompt,
+            tools: [
+              {
+                type: 'function',
+                name: 'search_pickup_locations',
+                description:
+                  'Search the Chasdei Lev distribution locations database and answer pickup time/location questions based ONLY on the provided data.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    location_query: { type: 'string' },
+                  },
+                  required: ['location_query'],
+                },
+              },
+              {
+                type: 'function',
+                name: 'handoff_to_router',
+                description:
+                  'Return control to the router agent when the caller asks about something other than pickup.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    question: {
+                      type: 'string',
+                      description:
+                        'The caller’s latest question, cleaned up but without changing the meaning.',
+                    },
+                  },
+                  required: ['question'],
+                },
+              },
+            ],
+          },
+        })
+      )
+
+      if (h.question) {
+        openaiWs.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: h.question }],
+            },
+          })
+        )
+
+        openaiWs.send(JSON.stringify({ type: 'response.create' }))
+      }
+
+      return
+    }
+
+    // ----- Any agent -> Router -----
     if (h.intent === 'router') {
       currentAgent = 'router'
       const routerPrompt =
