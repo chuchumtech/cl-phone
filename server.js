@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-import WebSocket, { WebSocketServer } from 'ws'   // ✅ proper ws imports
+import WebSocket, { WebSocketServer } from 'ws'
 import { supabase } from './supabaseClient.js'
 import { parse as parseUrl } from 'url'
 import axios from 'axios'
@@ -63,13 +63,14 @@ wss.on('connection', async (twilioWs, req) => {
 
     const routerPrompt = await loadAgentPrompt('router')
 
+    // 1) Configure session
     openaiWs.send(
       JSON.stringify({
         type: 'session.update',
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'cedar',            // 👈 choose voice here
+          voice: 'verse',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -90,6 +91,29 @@ wss.on('connection', async (twilioWs, req) => {
         },
       })
     )
+
+    // 2) Trigger initial greeting (no need for user to speak yet)
+    openaiWs.send(
+      JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'GREETING_TRIGGER',
+            },
+          ],
+        },
+      })
+    )
+
+    openaiWs.send(
+      JSON.stringify({
+        type: 'response.create',
+      })
+    )
   })
 
   // 2) Twilio → OpenAI (only when Leivi not talking)
@@ -102,13 +126,10 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       if (msg.event === 'media' && !isAssistantSpeaking) {
-        // Twilio media payload is μ-law 8kHz
-        // Because we set input_audio_format = g711_ulaw,
-        // we can pass it straight through as base64 bytes.
         openaiWs.send(
           JSON.stringify({
             type: 'input_audio_buffer.append',
-            audio: msg.media.payload, // already base64 ulaw
+            audio: msg.media.payload, // base64 g711_ulaw
           })
         )
       }
@@ -125,6 +146,7 @@ wss.on('connection', async (twilioWs, req) => {
   // 3) OpenAI → Twilio
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
+    console.log('[OpenAI evt]', event.type) // 👈 DEBUG: see everything
 
     // Audio stream from model
     if (event.type === 'response.output_audio.delta') {
@@ -134,7 +156,7 @@ wss.on('connection', async (twilioWs, req) => {
         twilioWs.send(
           JSON.stringify({
             event: 'media',
-            media: { payload: b64 }, // g711_ulaw already
+            media: { payload: b64 },
           })
         )
       }
@@ -155,10 +177,13 @@ wss.on('connection', async (twilioWs, req) => {
 
     // Function calls from tools
     if (event.type === 'response.function_call_arguments.delta') {
-      // when arguments are streamed, you usually accumulate;
-      // for simplicity assume we receive full args in one event:
       const { name, arguments: args } = event
       await handleToolCall(name, args)
+    }
+
+    // Any errors from server
+    if (event.type === 'error') {
+      console.error('[OpenAI error event]', event)
     }
   })
 
@@ -170,7 +195,7 @@ wss.on('connection', async (twilioWs, req) => {
   })
 
   openaiWs.on('error', (err) => {
-    console.error('[OpenAI] Error:', err)
+    console.error('[OpenAI] WS Error:', err)
     try {
       twilioWs.close()
     } catch {}
@@ -189,10 +214,7 @@ wss.on('connection', async (twilioWs, req) => {
   // ---------- helper: tool calls ----------
   async function handleToolCall(name, args) {
     if (name === 'determine_route') {
-      const resp = await axios.post(
-        process.env.ROUTER_ENDPOINT, // your Vercel determine-route
-        args
-      )
+      const resp = await axios.post(process.env.ROUTER_ENDPOINT, args)
 
       openaiWs.send(
         JSON.stringify({
@@ -203,10 +225,7 @@ wss.on('connection', async (twilioWs, req) => {
     }
 
     if (name === 'search_items') {
-      const resp = await axios.post(
-        process.env.ITEM_SEARCH_ENDPOINT, // your Vercel search-items
-        args
-      )
+      const resp = await axios.post(process.env.ITEM_SEARCH_ENDPOINT, args)
 
       openaiWs.send(
         JSON.stringify({
@@ -230,7 +249,6 @@ wss.on('connection', async (twilioWs, req) => {
           type: 'session.update',
           session: {
             instructions: itemsPrompt,
-            // keep same voice/model/audio formats
             tools: [
               {
                 name: 'search_items',
