@@ -15,6 +15,10 @@ const {
   ITEM_SEARCH_ENDPOINT,
 } = process.env
 
+// ---------------------------------------------------------------------------
+// 0. ENV GUARDS
+// ---------------------------------------------------------------------------
+
 if (!OPENAI_API_KEY) {
   console.error('[Fatal] Missing OPENAI_API_KEY')
   process.exit(1)
@@ -106,6 +110,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   console.log('[WS] New Twilio media stream connection')
 
+  // 3.1 Create OpenAI realtime socket
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
     {
@@ -116,14 +121,20 @@ wss.on('connection', async (twilioWs, req) => {
     }
   )
 
+  // Per-call state
   let isAssistantSpeaking = false
   let currentAgent = 'router'
   let callSid = null
-  let streamSid = null               // 👈 NEW: Twilio stream ID
+  let streamSid = null
   let openaiReady = false
   let twilioStarted = false
   let greetingSent = false
 
+  // Response + logging helpers
+  let responseActive = false
+  let currentAssistantTranscript = ''
+
+  // Map of function_call call_id -> toolName
   const functionCallMap = new Map()
 
   function maybeSendGreeting() {
@@ -138,12 +149,7 @@ wss.on('connection', async (twilioWs, req) => {
         item: {
           type: 'message',
           role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: 'GREETING_TRIGGER',
-            },
-          ],
+          content: [{ type: 'input_text', text: 'GREETING_TRIGGER' }],
         },
       })
     )
@@ -165,7 +171,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'verse',
+          voice: 'verse', // or 'cedar' etc
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -173,7 +179,8 @@ wss.on('connection', async (twilioWs, req) => {
             {
               type: 'function',
               name: 'determine_route',
-              description: 'Classify caller intent for Chasdei Lev phone calls.',
+              description:
+                'Classify caller intent for Chasdei Lev phone calls and decide which agent should handle it.',
               parameters: {
                 type: 'object',
                 properties: {
@@ -200,18 +207,19 @@ wss.on('connection', async (twilioWs, req) => {
 
       if (msg.event === 'start') {
         callSid = msg.start?.callSid || null
-        streamSid = msg.start?.streamSid || null     // 👈 capture streamSid
+        streamSid = msg.start?.streamSid || null
         console.log('[Twilio] Call started', callSid, 'streamSid=', streamSid)
         twilioStarted = true
         maybeSendGreeting()
       }
 
       if (msg.event === 'media') {
+        // Only listen when assistant is not speaking
         if (!isAssistantSpeaking) {
           openaiWs.send(
             JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: msg.media.payload, // base64 g711_ulaw
+              audio: msg.media.payload, // base64 g711_ulaw from Twilio
             })
           )
         }
@@ -246,18 +254,24 @@ wss.on('connection', async (twilioWs, req) => {
 
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
-    console.log('[OpenAI evt]', event.type)
 
     switch (event.type) {
+      // ---- RESPONSE LIFECYCLE ----
+      case 'response.created': {
+        responseActive = true
+        currentAssistantTranscript = ''
+        break
+      }
+
       // ---- AUDIO OUT ----
-      case 'response.audio.delta': {        // 👈 FIXED EVENT NAME
+      case 'response.audio.delta': {
         isAssistantSpeaking = true
         const b64 = event.delta
         if (b64 && streamSid) {
           twilioWs.send(
             JSON.stringify({
               event: 'media',
-              streamSid,                     // 👈 MUST INCLUDE streamSid
+              streamSid,
               media: { payload: b64 },
             })
           )
@@ -267,12 +281,31 @@ wss.on('connection', async (twilioWs, req) => {
         break
       }
 
-      case 'response.audio.done': {         // 👈 FIXED EVENT NAME
-        // audio finished; also rely on response.done
+      case 'response.audio_transcript.delta': {
+        // Build human-readable transcript line
+        if (typeof event.delta === 'string') {
+          currentAssistantTranscript += event.delta
+        }
+        break
+      }
+
+      case 'response.audio_transcript.done': {
+        if (currentAssistantTranscript.trim()) {
+          console.log(
+            `[Assistant][${currentAgent}]`,
+            currentAssistantTranscript.trim()
+          )
+        }
+        break
+      }
+
+      case 'response.audio.done': {
+        // audio stream finished; response.done will clean flags
         break
       }
 
       case 'response.done': {
+        responseActive = false
         isAssistantSpeaking = false
         break
       }
@@ -302,7 +335,7 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.function_call_arguments.delta': {
-        // ignore partials for now
+        // We ignore partial chunks; we handle the final combined args
         break
       }
 
@@ -332,6 +365,7 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       default:
+        // ignore other event types for now
         break
     }
   })
@@ -351,7 +385,7 @@ wss.on('connection', async (twilioWs, req) => {
   })
 
   // -------------------------------------------------------------------------
-  // 4. HANDOFF DETECTOR (unused for now but harmless)
+  // 4. HANDOFF DETECTOR (if we ever use textual JSON handoffs)
 // ---------------------------------------------------------------------------
 
   function looksLikeHandoff(text) {
@@ -369,6 +403,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   async function handleToolCall(toolName, args, callId) {
     try {
+      // ---------- ROUTER TOOL ----------
       if (toolName === 'determine_route') {
         if (!ROUTER_ENDPOINT) {
           console.error('[Tool] ROUTER_ENDPOINT not configured')
@@ -383,19 +418,20 @@ wss.on('connection', async (twilioWs, req) => {
 
         const output = resp.data || {}
 
+        // Must be a string
         openaiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
             item: {
               type: 'function_call_output',
               call_id: callId,
-              output: JSON.stringify(output),   
+              output: JSON.stringify(output),
             },
           })
         )
 
-        openaiWs.send(JSON.stringify({ type: 'response.create' }))
-
+        // Do NOT send response.create here – we immediately hand off,
+        // to avoid conversation_already_has_active_response.
         if (output.intent && output.intent === 'items') {
           await handleHandoff({
             handoff_from: 'router',
@@ -405,9 +441,11 @@ wss.on('connection', async (twilioWs, req) => {
           })
         }
 
+        // Could support other intents (pickup, orders) later
         return
       }
 
+      // ---------- ITEMS TOOL ----------
       if (toolName === 'search_items') {
         if (!ITEM_SEARCH_ENDPOINT) {
           console.error('[Tool] ITEM_SEARCH_ENDPOINT not configured')
@@ -432,6 +470,7 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
+        // Now the items agent should speak the answer
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
         return
       }
@@ -449,6 +488,7 @@ wss.on('connection', async (twilioWs, req) => {
   async function handleHandoff(h) {
     console.log('[Handoff]', h)
 
+    // ----- Router -> Items -----
     if (h.intent === 'items') {
       currentAgent = 'items'
       const itemsPrompt =
@@ -463,7 +503,8 @@ wss.on('connection', async (twilioWs, req) => {
               {
                 type: 'function',
                 name: 'search_items',
-                description: 'Search for Chasdei Lev items and return item details.',
+                description:
+                  'Search the Chasdei Lev items database and answer kashrus and package questions based ONLY on the provided data.',
                 parameters: {
                   type: 'object',
                   properties: {
@@ -477,6 +518,7 @@ wss.on('connection', async (twilioWs, req) => {
         })
       )
 
+      // If router already has a full question, feed it in immediately
       if (h.question) {
         openaiWs.send(
           JSON.stringify({
@@ -491,8 +533,11 @@ wss.on('connection', async (twilioWs, req) => {
 
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
       }
+
+      return
     }
 
+    // ----- Items -> Router (or any agent -> router) -----
     if (h.intent === 'router') {
       currentAgent = 'router'
       const routerPrompt =
@@ -507,7 +552,8 @@ wss.on('connection', async (twilioWs, req) => {
               {
                 type: 'function',
                 name: 'determine_route',
-                description: 'Classify caller intent for Chasdei Lev phone calls.',
+                description:
+                  'Classify caller intent for Chasdei Lev phone calls and decide which agent should handle it.',
                 parameters: {
                   type: 'object',
                   properties: {
@@ -536,6 +582,8 @@ wss.on('connection', async (twilioWs, req) => {
 
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
       }
+
+      return
     }
   }
 })
