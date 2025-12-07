@@ -389,7 +389,7 @@ wss.on('connection', async (twilioWs, req) => {
             item: {
               type: 'function_call_output',
               call_id: callId,
-              output: JSON.stringify(output),   /
+              output: JSON.stringify(output),   
             },
           })
         )
