@@ -119,11 +119,11 @@ wss.on('connection', async (twilioWs, req) => {
   let isAssistantSpeaking = false
   let currentAgent = 'router'
   let callSid = null
+  let streamSid = null               // 👈 NEW: Twilio stream ID
   let openaiReady = false
   let twilioStarted = false
   let greetingSent = false
 
-  // Map: call_id -> toolName for function calling
   const functionCallMap = new Map()
 
   function maybeSendGreeting() {
@@ -132,7 +132,6 @@ wss.on('connection', async (twilioWs, req) => {
     greetingSent = true
     console.log('[Greeting] Sending GREETING_TRIGGER to OpenAI')
 
-    // Trigger greeting
     openaiWs.send(
       JSON.stringify({
         type: 'conversation.item.create',
@@ -166,9 +165,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          // Use a known-good voice for gpt-4o-realtime-preview
-          // (alloy, ash, ballad, coral, echo, sage, shimmer, verse)
-          voice: 'cedar',
+          voice: 'verse',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -203,7 +200,8 @@ wss.on('connection', async (twilioWs, req) => {
 
       if (msg.event === 'start') {
         callSid = msg.start?.callSid || null
-        console.log('[Twilio] Call started', callSid)
+        streamSid = msg.start?.streamSid || null     // 👈 capture streamSid
+        console.log('[Twilio] Call started', callSid, 'streamSid=', streamSid)
         twilioStarted = true
         maybeSendGreeting()
       }
@@ -216,8 +214,6 @@ wss.on('connection', async (twilioWs, req) => {
               audio: msg.media.payload, // base64 g711_ulaw
             })
           )
-        } else {
-          // Ignore caller audio while assistant is speaking
         }
       }
 
@@ -254,32 +250,34 @@ wss.on('connection', async (twilioWs, req) => {
 
     switch (event.type) {
       // ---- AUDIO OUT ----
-      case 'response.output_audio.delta': {
+      case 'response.audio.delta': {        // 👈 FIXED EVENT NAME
         isAssistantSpeaking = true
         const b64 = event.delta
-        if (b64) {
+        if (b64 && streamSid) {
           twilioWs.send(
             JSON.stringify({
               event: 'media',
-              media: { payload: b64 }, // base64 g711_ulaw
+              streamSid,                     // 👈 MUST INCLUDE streamSid
+              media: { payload: b64 },
             })
           )
+        } else if (!streamSid) {
+          console.warn('[Twilio] Missing streamSid, cannot send audio')
         }
         break
       }
 
-      case 'response.output_audio.done': {
-        // audio finished for this response (we also rely on response.done)
+      case 'response.audio.done': {         // 👈 FIXED EVENT NAME
+        // audio finished; also rely on response.done
         break
       }
 
       case 'response.done': {
-        // Full response finished; safe to listen again
         isAssistantSpeaking = false
         break
       }
 
-      // ---- TEXT OUT (optionally carry handoff JSON if you want) ----
+      // ---- TEXT OUT / optional handoff via text ----
       case 'response.output_text.delta': {
         const text = event.delta
         if (text && looksLikeHandoff(text)) {
@@ -304,7 +302,7 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'response.function_call_arguments.delta': {
-        // We could accumulate args here; we wait for .done
+        // ignore partials for now
         break
       }
 
@@ -334,7 +332,6 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       default:
-        // ignore other events
         break
     }
   })
@@ -354,8 +351,8 @@ wss.on('connection', async (twilioWs, req) => {
   })
 
   // -------------------------------------------------------------------------
-  // 4. HANDOFF DETECTOR (if you ever embed JSON in text)
-  // -------------------------------------------------------------------------
+  // 4. HANDOFF DETECTOR (unused for now but harmless)
+// ---------------------------------------------------------------------------
 
   function looksLikeHandoff(text) {
     try {
@@ -386,7 +383,6 @@ wss.on('connection', async (twilioWs, req) => {
 
         const output = resp.data || {}
 
-        // Attach function_call_output
         openaiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
@@ -400,7 +396,6 @@ wss.on('connection', async (twilioWs, req) => {
 
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
 
-        // Optionally: auto-handoff when router says so
         if (output.intent && output.intent === 'items') {
           await handleHandoff({
             handoff_from: 'router',
